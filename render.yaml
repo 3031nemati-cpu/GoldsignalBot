@@ -1,0 +1,7 @@
+services:
+  - type: worker
+    name: goldsignalbot
+    runtime: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
+    plan: free
