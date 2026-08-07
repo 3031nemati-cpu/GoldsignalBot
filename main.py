@@ -29,12 +29,16 @@ def get_gold_price():
 def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-    try:
-        requests.post(
-            url,
-            data={
-                "chat_id": CHAT_ID,
-                "text": text
+    response = requests.post(
+        url,
+        data={
+            "chat_id": CHAT_ID,
+            "text": text
+        }
+    )
+
+    print(response.status_code)
+    print(response.text)
             },
             timeout=15
         )
