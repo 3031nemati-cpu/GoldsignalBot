@@ -12,8 +12,8 @@ def get_gold_price():
     url = f"https://api.twelvedata.com/price?symbol={SYMBOL}&apikey={API_KEY}"
 
     try:
-        response = requests.get(url, timeout=15)
-        data = response.json()
+        r = requests.get(url, timeout=15)
+        data = r.json()
 
         if "price" in data:
             return float(data["price"])
@@ -22,7 +22,7 @@ def get_gold_price():
         return None
 
     except Exception as e:
-        print("Price Error:", e)
+        print("Request Error:", e)
         return None
 
 
@@ -38,8 +38,7 @@ def send_message(text):
             },
             timeout=15
         )
-        print("Telegram Message Sent")
-
+        print("Telegram message sent.")
     except Exception as e:
         print("Telegram Error:", e)
 
@@ -67,4 +66,4 @@ Powered by GoldSignalBot
     else:
         print("No price received.")
 
-    time.sleep(60)
+    time.sleep(3600)
