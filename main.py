@@ -4,7 +4,7 @@ import requests
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-API_KEY = os.getenv("API_KEY")
+API_KEY = os.getenv("TWELVEDATA_API_KEY")
 
 SYMBOL = "XAU/USD"
 
@@ -30,7 +30,7 @@ def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     try:
-        r = requests.post(
+        requests.post(
             url,
             data={
                 "chat_id": CHAT_ID,
@@ -38,8 +38,7 @@ def send_message(text):
             },
             timeout=15
         )
-
-        print("Telegram:", r.text)
+        print("Telegram Message Sent")
 
     except Exception as e:
         print("Telegram Error:", e)
@@ -66,6 +65,6 @@ Powered by GoldSignalBot
         send_message(message)
 
     else:
-        print("Unable to get gold price.")
+        print("No price received.")
 
     time.sleep(3600)
