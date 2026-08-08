@@ -1,11 +1,14 @@
 import os
 import time
-import requests
 from datetime import datetime, timezone
 
-# =========================
-# SETTINGS
-# =========================
+import requests
+
+# ============================================================
+# Gold Signal Bot - BUY / SELL / HOLD
+# Market: XAU/USD
+# Timeframe: 5 minutes
+# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -13,190 +16,117 @@ API_KEY = os.getenv("API_KEY")
 
 SYMBOL = "XAU/USD"
 INTERVAL = "5min"
+CHECK_INTERVAL = 300          # 5 minutes
+PRICE_CHANGE_THRESHOLD = 0.50
 
-CHECK_EVERY = 300          # 5 minutes
-MIN_CANDLES = 60
+# Signal settings
+RSI_BUY_LEVEL = 55
+RSI_SELL_LEVEL = 45
 
-RSI_PERIOD = 14
-EMA_FAST = 9
-EMA_SLOW = 21
-ATR_PERIOD = 14
-
-ATR_SL_MULTIPLIER = 1.5
-ATR_TP_MULTIPLIER = 2.0
-
-# جلوگیری از ارسال سیگنال تکراری
+# Do not send the same signal repeatedly.
 last_signal = None
-last_signal_time = None
 
 
-# =========================
-# TELEGRAM
-# =========================
+def log(message):
+    """Print a timestamped message for Railway Logs."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"[{now}] {message}", flush=True)
 
-def send_message(text):
-
-    if not BOT_TOKEN or not CHAT_ID:
-        print("ERROR: BOT_TOKEN or CHAT_ID is missing.")
-        return False
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
-    try:
-
-        response = requests.post(
-            url,
-            data={
-                "chat_id": CHAT_ID,
-                "text": text
-            },
-            timeout=15
-        )
-
-        if response.ok:
-            print("Telegram message sent.")
-            return True
-
-        print("Telegram error:", response.text)
-        return False
-
-    except Exception as e:
-
-        print("Telegram connection error:", e)
-        return False
-
-
-# =========================
-# GET MARKET DATA
-# =========================
 
 def get_candles():
-
+    """Get recent 5-minute XAU/USD candles from Twelve Data."""
     url = "https://api.twelvedata.com/time_series"
 
     params = {
         "symbol": SYMBOL,
         "interval": INTERVAL,
-        "outputsize": 100,
+        "outputsize": 50,
         "apikey": API_KEY,
-        "timezone": "UTC"
+        "format": "JSON",
     }
 
     try:
-
-        response = requests.get(
-            url,
-            params=params,
-            timeout=20
-        )
-
+        response = requests.get(url, params=params, timeout=20)
         data = response.json()
 
-        if data.get("status") == "error":
-            print("API Error:", data)
-            return []
+        if "status" in data and data["status"] == "error":
+            log(f"Twelve Data API Error: {data}")
+            return None
 
-        values = data.get("values", [])
+        values = data.get("values")
+        if not values or len(values) < 22:
+            log("Not enough candle data received.")
+            return None
 
-        if not values:
-            print("No candle data received.")
-            return []
+        # Twelve Data normally returns newest candle first.
+        values = list(reversed(values))
 
         candles = []
-
         for item in values:
-
             candles.append({
                 "datetime": item["datetime"],
                 "open": float(item["open"]),
                 "high": float(item["high"]),
                 "low": float(item["low"]),
-                "close": float(item["close"])
+                "close": float(item["close"]),
             })
-
-        # قدیمی‌ترین → جدیدترین
-        candles.reverse()
 
         return candles
 
     except Exception as e:
+        log(f"Error getting market data: {e}")
+        return None
 
-        print("Market data error:", e)
-        return []
 
-
-# =========================
-# EMA
-# =========================
-
-def calculate_ema(prices, period):
-
-    if len(prices) < period:
+def ema(values, period):
+    """Calculate Exponential Moving Average."""
+    if len(values) < period:
         return None
 
     multiplier = 2 / (period + 1)
+    result = sum(values[:period]) / period
 
-    ema = sum(prices[:period]) / period
+    for price in values[period:]:
+        result = (price - result) * multiplier + result
 
-    for price in prices[period:]:
-        ema = (price - ema) * multiplier + ema
-
-    return ema
+    return result
 
 
-# =========================
-# RSI
-# =========================
-
-def calculate_rsi(prices, period=14):
-
-    if len(prices) < period + 1:
+def rsi(values, period=14):
+    """Calculate RSI using Wilder-style smoothing."""
+    if len(values) < period + 1:
         return None
 
     gains = []
     losses = []
 
-    for i in range(1, len(prices)):
-
-        change = prices[i] - prices[i - 1]
-
-        if change > 0:
-            gains.append(change)
-            losses.append(0)
-
-        else:
-            gains.append(0)
-            losses.append(abs(change))
+    for i in range(1, len(values)):
+        change = values[i] - values[i - 1]
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
 
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
     for i in range(period, len(gains)):
-
         avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
         avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
 
     if avg_loss == 0:
-        return 100
+        return 100.0
 
     rs = avg_gain / avg_loss
-
     return 100 - (100 / (1 + rs))
 
 
-# =========================
-# ATR
-# =========================
-
-def calculate_atr(candles, period=14):
-
+def atr(candles, period=14):
+    """Calculate Average True Range."""
     if len(candles) < period + 1:
         return None
 
     true_ranges = []
 
     for i in range(1, len(candles)):
-
         high = candles[i]["high"]
         low = candles[i]["low"]
         previous_close = candles[i - 1]["close"]
@@ -204,315 +134,170 @@ def calculate_atr(candles, period=14):
         tr = max(
             high - low,
             abs(high - previous_close),
-            abs(low - previous_close)
+            abs(low - previous_close),
         )
-
         true_ranges.append(tr)
 
-    atr = sum(true_ranges[:period]) / period
+    if len(true_ranges) < period:
+        return None
 
-    for tr in true_ranges[period:]:
-        atr = ((atr * (period - 1)) + tr) / period
-
-    return atr
+    # Simple average of the latest period for a stable first version.
+    return sum(true_ranges[-period:]) / period
 
 
-# =========================
-# MARKET FRESHNESS
-# =========================
+def calculate_signal(candles):
+    """Calculate BUY / SELL / HOLD from EMA, RSI and ATR."""
+    closes = [c["close"] for c in candles]
 
-def is_market_data_fresh(candles):
+    ema9 = ema(closes, 9)
+    ema21 = ema(closes, 21)
+    current_price = closes[-1]
+    current_rsi = rsi(closes, 14)
+    current_atr = atr(candles, 14)
+
+    if None in (ema9, ema21, current_rsi, current_atr):
+        return None
+
+    # Conservative confirmation:
+    # BUY = EMA9 above EMA21 + price above EMA9 + RSI >= 55
+    # SELL = EMA9 below EMA21 + price below EMA9 + RSI <= 45
+    # Otherwise HOLD.
+    if (
+        ema9 > ema21
+        and current_price > ema9
+        and current_rsi >= RSI_BUY_LEVEL
+    ):
+        signal = "BUY"
+
+    elif (
+        ema9 < ema21
+        and current_price < ema9
+        and current_rsi <= RSI_SELL_LEVEL
+    ):
+        signal = "SELL"
+
+    else:
+        signal = "HOLD"
+
+    return {
+        "signal": signal,
+        "price": current_price,
+        "ema9": ema9,
+        "ema21": ema21,
+        "rsi": current_rsi,
+        "atr": current_atr,
+        "candle_time": candles[-1]["datetime"],
+    }
+
+
+def send_message(text):
+    """Send a message to Telegram."""
+    if not BOT_TOKEN or not CHAT_ID:
+        log("ERROR: BOT_TOKEN or CHAT_ID is missing.")
+        return False
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text,
+    }
 
     try:
+        response = requests.post(url, data=payload, timeout=20)
+        data = response.json()
 
-        last_datetime = candles[-1]["datetime"]
+        if response.ok and data.get("ok"):
+            log("Telegram message sent.")
+            return True
 
-        candle_time = datetime.strptime(
-            last_datetime,
-            "%Y-%m-%d %H:%M:%S"
-        ).replace(tzinfo=timezone.utc)
-
-        now = datetime.now(timezone.utc)
-
-        age_minutes = (now - candle_time).total_seconds() / 60
-
-        print(f"Latest candle age: {age_minutes:.1f} minutes")
-
-        # اگر داده بیش از 30 دقیقه قدیمی باشد
-        if age_minutes > 30:
-
-            print("Market data is stale. No signal.")
-
-            return False
-
-        return True
+        log(f"Telegram API Error: {data}")
+        return False
 
     except Exception as e:
-
-        print("Freshness check error:", e)
-
+        log(f"Telegram send error: {e}")
         return False
 
 
-# =========================
-# SIGNAL ENGINE
-# =========================
-
-def analyze_market(candles):
-
-    if len(candles) < MIN_CANDLES:
-
-        print(
-            f"Not enough candles: "
-            f"{len(candles)}/{MIN_CANDLES}"
-        )
-
-        return None
-
-    if not is_market_data_fresh(candles):
-
-        return None
-
-    closes = [
-        candle["close"]
-        for candle in candles
-    ]
-
-    current_price = closes[-1]
-
-    ema_fast = calculate_ema(
-        closes,
-        EMA_FAST
-    )
-
-    ema_slow = calculate_ema(
-        closes,
-        EMA_SLOW
-    )
-
-    rsi = calculate_rsi(
-        closes,
-        RSI_PERIOD
-    )
-
-    atr = calculate_atr(
-        candles,
-        ATR_PERIOD
-    )
-
-    if None in (
-        ema_fast,
-        ema_slow,
-        rsi,
-        atr
-    ):
-
-        print("Indicator calculation failed.")
-
-        return None
-
-    print(f"Current Price: {current_price:.2f}")
-    print(f"EMA {EMA_FAST}: {ema_fast:.2f}")
-    print(f"EMA {EMA_SLOW}: {ema_slow:.2f}")
-    print(f"RSI: {rsi:.2f}")
-    print(f"ATR: {atr:.2f}")
-
-    # =========================
-    # BUY CONDITION
-    # =========================
-
-    if (
-        ema_fast > ema_slow
-        and rsi >= 55
-        and rsi < 70
-        and current_price > ema_fast
-    ):
-
-        signal = "BUY"
-
-        entry = current_price
-
-        stop_loss = entry - (
-            atr * ATR_SL_MULTIPLIER
-        )
-
-        take_profit = entry + (
-            atr * ATR_TP_MULTIPLIER
-        )
-
-        return {
-            "signal": signal,
-            "price": current_price,
-            "entry": entry,
-            "sl": stop_loss,
-            "tp": take_profit,
-            "rsi": rsi,
-            "ema_fast": ema_fast,
-            "ema_slow": ema_slow,
-            "atr": atr
-        }
-
-    # =========================
-    # SELL CONDITION
-    # =========================
-
-    if (
-        ema_fast < ema_slow
-        and rsi <= 45
-        and rsi > 30
-        and current_price < ema_fast
-    ):
-
-        signal = "SELL"
-
-        entry = current_price
-
-        stop_loss = entry + (
-            atr * ATR_SL_MULTIPLIER
-        )
-
-        take_profit = entry - (
-            atr * ATR_TP_MULTIPLIER
-        )
-
-        return {
-            "signal": signal,
-            "price": current_price,
-            "entry": entry,
-            "sl": stop_loss,
-            "tp": take_profit,
-            "rsi": rsi,
-            "ema_fast": ema_fast,
-            "ema_slow": ema_slow,
-            "atr": atr
-        }
-
-    print("No trading signal.")
-
-    return None
-
-
-# =========================
-# SIGNAL MESSAGE
-# =========================
-
-def create_signal_message(result):
-
+def format_signal(result):
+    """Create a readable Telegram signal message."""
     signal = result["signal"]
 
     if signal == "BUY":
-
-        emoji = "🟢"
-        direction = "BUY / خرید"
-
+        title = "🟢 GOLD SIGNAL — BUY"
+    elif signal == "SELL":
+        title = "🔴 GOLD SIGNAL — SELL"
     else:
+        title = "⚪ GOLD SIGNAL — HOLD"
 
-        emoji = "🔴"
-        direction = "SELL / فروش"
-
-    message = f"""
-{emoji} GOLD TRADING SIGNAL
-
-━━━━━━━━━━━━━━
-
-Symbol: XAU/USD
-Timeframe: 5 Minutes
-
-Signal:
-{direction}
-
-━━━━━━━━━━━━━━
-
-💰 Entry:
-{result["entry"]:.2f}
-
-🛑 Stop Loss:
-{result["sl"]:.2f}
-
-🎯 Take Profit:
-{result["tp"]:.2f}
-
-━━━━━━━━━━━━━━
-
-📊 Indicators
-
-EMA 9:
-{result["ema_fast"]:.2f}
-
-EMA 21:
-{result["ema_slow"]:.2f}
-
-RSI:
-{result["rsi"]:.2f}
-
-ATR:
-{result["atr"]:.2f}
-
-━━━━━━━━━━━━━━
-
-⚠️ Automated technical signal
-Not financial advice.
-"""
-
-    return message
+    return (
+        f"{title}\n\n"
+        f"Symbol: {SYMBOL}\n"
+        f"Timeframe: {INTERVAL}\n"
+        f"Price: {result['price']:.2f}\n"
+        f"EMA 9: {result['ema9']:.2f}\n"
+        f"EMA 21: {result['ema21']:.2f}\n"
+        f"RSI: {result['rsi']:.2f}\n"
+        f"ATR: {result['atr']:.2f}\n"
+        f"Candle: {result['candle_time']}\n\n"
+        f"Signal: {signal}\n"
+        f"⚠️ This is a market analysis signal, not an automatic trade."
+    )
 
 
-# =========================
-# MAIN LOOP
-# =========================
+def main():
+    global last_signal
 
-print("Gold Signal Bot Started...")
-print("Symbol:", SYMBOL)
-print("Timeframe:", INTERVAL)
-print("Checking market every 5 minutes...")
-print("Price change threshold replaced by technical signal engine.")
+    log("========================================")
+    log("Gold Signal Bot Started...")
+    log(f"Symbol: {SYMBOL}")
+    log(f"Timeframe: {INTERVAL}")
+    log("Checking market every 5 minutes.")
+    log(f"BUY RSI level: {RSI_BUY_LEVEL}")
+    log(f"SELL RSI level: {RSI_SELL_LEVEL}")
+    log("========================================")
+
+    # Basic configuration check
+    if not BOT_TOKEN:
+        log("ERROR: BOT_TOKEN is not configured.")
+    if not CHAT_ID:
+        log("ERROR: CHAT_ID is not configured.")
+    if not API_KEY:
+        log("ERROR: API_KEY is not configured.")
+
+    while True:
+        try:
+            candles = get_candles()
+
+            if candles:
+                result = calculate_signal(candles)
+
+                if result:
+                    signal = result["signal"]
+
+                    log(f"Current gold price: {result['price']:.2f}")
+                    log(f"EMA 9: {result['ema9']:.2f}")
+                    log(f"EMA 21: {result['ema21']:.2f}")
+                    log(f"RSI: {result['rsi']:.2f}")
+                    log(f"ATR: {result['atr']:.2f}")
+                    log(f"Signal: {signal}")
+
+                    # Send only when the signal changes.
+                    if signal != last_signal:
+                        message = format_signal(result)
+
+                        if send_message(message):
+                            last_signal = signal
+                            log(f"New signal sent: {signal}")
+                    else:
+                        log(f"Signal unchanged ({signal}). No Telegram message sent.")
+
+            time.sleep(CHECK_INTERVAL)
+
+        except Exception as e:
+            log(f"Main loop error: {e}")
+            time.sleep(60)
 
 
-while True:
-
-    try:
-
-        candles = get_candles()
-
-        if candles:
-
-            result = analyze_market(candles)
-
-            if result:
-
-                current_signal = result["signal"]
-
-                print(
-                    f"Detected signal: "
-                    f"{current_signal}"
-                )
-
-                # فقط در صورت تغییر سیگنال پیام بفرست
-                if current_signal != last_signal:
-
-                    message = create_signal_message(
-                        result
-                    )
-
-                    if send_message(message):
-
-                        last_signal = current_signal
-
-                        last_signal_time = datetime.now(
-                            timezone.utc
-                        )
-
-                else:
-
-                    print(
-                        "Same signal as previous. "
-                        "Message not sent."
-                    )
-
-        time.sleep(CHECK_EVERY)
-
-    except Exception as e:
-
-        print("Main loop error:", e)
-
-        time.sleep(60)
+if __name__ == "__main__":
+    main()
