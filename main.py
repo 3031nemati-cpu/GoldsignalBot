@@ -1,14 +1,7 @@
 import os
 import time
 from datetime import datetime, timezone
-
 import requests
-
-# ============================================================
-# Gold Signal Bot - BUY / SELL / HOLD
-# Market: XAU/USD
-# Timeframe: 5 minutes
-# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -16,90 +9,85 @@ API_KEY = os.getenv("API_KEY")
 
 SYMBOL = "XAU/USD"
 INTERVAL = "5min"
-CHECK_INTERVAL = 300          # 5 minutes
-PRICE_CHANGE_THRESHOLD = 0.50
+CHECK_INTERVAL = 300
 
-# Signal settings
-RSI_BUY_LEVEL = 55
-RSI_SELL_LEVEL = 45
+EMA_FAST = 9
+EMA_SLOW = 21
+RSI_PERIOD = 14
+ATR_PERIOD = 14
 
-# Do not send the same signal repeatedly.
+RSI_BUY = 55
+RSI_SELL = 45
+
+SL_ATR = 1.5
+TP1_ATR = 1.0
+TP2_ATR = 2.0
+TP3_ATR = 3.0
+
 last_signal = None
 
 
 def log(message):
-    """Print a timestamped message for Railway Logs."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"[{now}] {message}", flush=True)
 
 
 def get_candles():
-    """Get recent 5-minute XAU/USD candles from Twelve Data."""
     url = "https://api.twelvedata.com/time_series"
-
     params = {
         "symbol": SYMBOL,
         "interval": INTERVAL,
-        "outputsize": 50,
+        "outputsize": 100,
         "apikey": API_KEY,
         "format": "JSON",
+        "timezone": "UTC",
     }
 
     try:
         response = requests.get(url, params=params, timeout=20)
         data = response.json()
 
-        if "status" in data and data["status"] == "error":
+        if data.get("status") == "error":
             log(f"Twelve Data API Error: {data}")
             return None
 
         values = data.get("values")
-        if not values or len(values) < 22:
-            log("Not enough candle data received.")
+        if not values or len(values) < 30:
+            log("Not enough candle data.")
             return None
 
-        # Twelve Data normally returns newest candle first.
-        values = list(reversed(values))
-
-        candles = []
-        for item in values:
-            candles.append({
-                "datetime": item["datetime"],
-                "open": float(item["open"]),
-                "high": float(item["high"]),
-                "low": float(item["low"]),
-                "close": float(item["close"]),
-            })
-
-        return candles
+        values.reverse()
+        return [
+            {
+                "datetime": x["datetime"],
+                "open": float(x["open"]),
+                "high": float(x["high"]),
+                "low": float(x["low"]),
+                "close": float(x["close"]),
+            }
+            for x in values
+        ]
 
     except Exception as e:
-        log(f"Error getting market data: {e}")
+        log(f"Market data error: {e}")
         return None
 
 
 def ema(values, period):
-    """Calculate Exponential Moving Average."""
     if len(values) < period:
         return None
-
     multiplier = 2 / (period + 1)
     result = sum(values[:period]) / period
-
-    for price in values[period:]:
-        result = (price - result) * multiplier + result
-
+    for value in values[period:]:
+        result = (value - result) * multiplier + result
     return result
 
 
 def rsi(values, period=14):
-    """Calculate RSI using Wilder-style smoothing."""
     if len(values) < period + 1:
         return None
 
-    gains = []
-    losses = []
-
+    gains, losses = [], []
     for i in range(1, len(values)):
         change = values[i] - values[i - 1]
         gains.append(max(change, 0))
@@ -120,91 +108,197 @@ def rsi(values, period=14):
 
 
 def atr(candles, period=14):
-    """Calculate Average True Range."""
     if len(candles) < period + 1:
         return None
 
-    true_ranges = []
-
+    trs = []
     for i in range(1, len(candles)):
         high = candles[i]["high"]
         low = candles[i]["low"]
-        previous_close = candles[i - 1]["close"]
+        prev_close = candles[i - 1]["close"]
+        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
 
-        tr = max(
-            high - low,
-            abs(high - previous_close),
-            abs(low - previous_close),
-        )
-        true_ranges.append(tr)
+    return sum(trs[-period:]) / period
 
-    if len(true_ranges) < period:
+
+def data_is_fresh(candles):
+    try:
+        candle_time = datetime.strptime(
+            candles[-1]["datetime"], "%Y-%m-%d %H:%M:%S"
+        ).replace(tzinfo=timezone.utc)
+
+        age = (datetime.now(timezone.utc) - candle_time).total_seconds() / 60
+        log(f"Latest candle age: {age:.1f} minutes")
+
+        if age > 30:
+            log("Market data is stale. Analysis paused.")
+            return False
+        return True
+
+    except Exception as e:
+        log(f"Freshness check error: {e}")
+        return False
+
+
+def trend_strength(price, ema9, ema21, current_rsi, current_atr):
+    if current_atr <= 0:
+        return "Neutral", 0
+
+    gap_score = min(40, abs(ema9 - ema21) / current_atr * 40)
+    price_score = min(30, abs(price - ema9) / current_atr * 30)
+
+    if ema9 > ema21 and current_rsi >= 55:
+        direction = "Bullish"
+        rsi_score = min(30, (current_rsi - 50) * 1.5)
+    elif ema9 < ema21 and current_rsi <= 45:
+        direction = "Bearish"
+        rsi_score = min(30, (50 - current_rsi) * 1.5)
+    else:
+        direction = "Neutral"
+        rsi_score = 0
+
+    score = round(min(100, gap_score + price_score + rsi_score))
+
+    if direction == "Bullish":
+        label = "Strong Bullish" if score >= 70 else "Bullish"
+    elif direction == "Bearish":
+        label = "Strong Bearish" if score >= 70 else "Bearish"
+    else:
+        label = "Neutral"
+
+    return label, score
+
+
+def analyze_market(candles):
+    if len(candles) < 30 or not data_is_fresh(candles):
         return None
 
-    # Simple average of the latest period for a stable first version.
-    return sum(true_ranges[-period:]) / period
-
-
-def calculate_signal(candles):
-    """Calculate BUY / SELL / HOLD from EMA, RSI and ATR."""
     closes = [c["close"] for c in candles]
+    price = closes[-1]
 
-    ema9 = ema(closes, 9)
-    ema21 = ema(closes, 21)
-    current_price = closes[-1]
-    current_rsi = rsi(closes, 14)
-    current_atr = atr(candles, 14)
+    ema9 = ema(closes, EMA_FAST)
+    ema21 = ema(closes, EMA_SLOW)
+    current_rsi = rsi(closes, RSI_PERIOD)
+    current_atr = atr(candles, ATR_PERIOD)
 
     if None in (ema9, ema21, current_rsi, current_atr):
         return None
 
-    # Conservative confirmation:
-    # BUY = EMA9 above EMA21 + price above EMA9 + RSI >= 55
-    # SELL = EMA9 below EMA21 + price below EMA9 + RSI <= 45
-    # Otherwise HOLD.
-    if (
-        ema9 > ema21
-        and current_price > ema9
-        and current_rsi >= RSI_BUY_LEVEL
-    ):
+    if ema9 > ema21 and price > ema9 and current_rsi >= RSI_BUY:
         signal = "BUY"
-
-    elif (
-        ema9 < ema21
-        and current_price < ema9
-        and current_rsi <= RSI_SELL_LEVEL
-    ):
+    elif ema9 < ema21 and price < ema9 and current_rsi <= RSI_SELL:
         signal = "SELL"
-
     else:
         signal = "HOLD"
 
+    strength, score = trend_strength(
+        price, ema9, ema21, current_rsi, current_atr
+    )
+
+    reversal_width = max(current_atr * 0.5, abs(ema9 - ema21))
+    reversal_low = ema21 - reversal_width
+    reversal_high = ema21 + reversal_width
+
+    if signal == "BUY":
+        entry = price
+        stop = entry - SL_ATR * current_atr
+        tp1 = entry + TP1_ATR * current_atr
+        tp2 = entry + TP2_ATR * current_atr
+        tp3 = entry + TP3_ATR * current_atr
+    elif signal == "SELL":
+        entry = price
+        stop = entry + SL_ATR * current_atr
+        tp1 = entry - TP1_ATR * current_atr
+        tp2 = entry - TP2_ATR * current_atr
+        tp3 = entry - TP3_ATR * current_atr
+    else:
+        entry = stop = tp1 = tp2 = tp3 = None
+
+    weakening = (
+        (signal == "BUY" and (current_rsi < RSI_BUY or price < ema9))
+        or
+        (signal == "SELL" and (current_rsi > RSI_SELL or price > ema9))
+    )
+
     return {
         "signal": signal,
-        "price": current_price,
+        "price": price,
         "ema9": ema9,
         "ema21": ema21,
         "rsi": current_rsi,
         "atr": current_atr,
+        "strength": strength,
+        "score": score,
+        "entry": entry,
+        "stop": stop,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "reversal_low": reversal_low,
+        "reversal_high": reversal_high,
+        "weakening": weakening,
         "candle_time": candles[-1]["datetime"],
     }
 
 
+def format_signal(r):
+    if r["signal"] == "BUY":
+        title = "🟢 GOLD SIGNAL — BUY"
+    elif r["signal"] == "SELL":
+        title = "🔴 GOLD SIGNAL — SELL"
+    else:
+        title = "⚪ GOLD SIGNAL — HOLD"
+
+    text = (
+        f"{title}\n\n"
+        f"Symbol: {SYMBOL}\n"
+        f"Timeframe: {INTERVAL}\n"
+        f"Price: {r['price']:.2f}\n\n"
+        f"📊 Trend: {r['strength']}\n"
+        f"Trend Score: {r['score']}/100\n\n"
+        f"EMA 9: {r['ema9']:.2f}\n"
+        f"EMA 21: {r['ema21']:.2f}\n"
+        f"RSI: {r['rsi']:.2f}\n"
+        f"ATR: {r['atr']:.2f}\n"
+    )
+
+    if r["signal"] in ("BUY", "SELL"):
+        text += (
+            f"\n💰 Entry: {r['entry']:.2f}\n"
+            f"🎯 TP1: {r['tp1']:.2f}\n"
+            f"🎯 TP2: {r['tp2']:.2f}\n"
+            f"🎯 TP3: {r['tp3']:.2f}\n"
+            f"🛑 Stop Loss: {r['stop']:.2f}\n"
+        )
+
+    text += (
+        f"\n🔄 Reversal/Caution Zone:\n"
+        f"{r['reversal_low']:.2f} - {r['reversal_high']:.2f}\n"
+    )
+
+    if r["weakening"]:
+        text += "\n⚠️ Trend weakening: caution.\n"
+
+    text += (
+        f"\nCandle: {r['candle_time']}\n"
+        f"⚠️ Technical analysis only — not an automatic trade."
+    )
+    return text
+
+
 def send_message(text):
-    """Send a message to Telegram."""
     if not BOT_TOKEN or not CHAT_ID:
         log("ERROR: BOT_TOKEN or CHAT_ID is missing.")
         return False
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-    }
-
     try:
-        response = requests.post(url, data=payload, timeout=20)
+        response = requests.post(
+            url,
+            data={"chat_id": CHAT_ID, "text": text},
+            timeout=20,
+        )
         data = response.json()
 
         if response.ok and data.get("ok"):
@@ -215,82 +309,51 @@ def send_message(text):
         return False
 
     except Exception as e:
-        log(f"Telegram send error: {e}")
+        log(f"Telegram connection error: {e}")
         return False
-
-
-def format_signal(result):
-    """Create a readable Telegram signal message."""
-    signal = result["signal"]
-
-    if signal == "BUY":
-        title = "🟢 GOLD SIGNAL — BUY"
-    elif signal == "SELL":
-        title = "🔴 GOLD SIGNAL — SELL"
-    else:
-        title = "⚪ GOLD SIGNAL — HOLD"
-
-    return (
-        f"{title}\n\n"
-        f"Symbol: {SYMBOL}\n"
-        f"Timeframe: {INTERVAL}\n"
-        f"Price: {result['price']:.2f}\n"
-        f"EMA 9: {result['ema9']:.2f}\n"
-        f"EMA 21: {result['ema21']:.2f}\n"
-        f"RSI: {result['rsi']:.2f}\n"
-        f"ATR: {result['atr']:.2f}\n"
-        f"Candle: {result['candle_time']}\n\n"
-        f"Signal: {signal}\n"
-        f"⚠️ This is a market analysis signal, not an automatic trade."
-    )
 
 
 def main():
     global last_signal
 
-    log("========================================")
-    log("Gold Signal Bot Started...")
+    log("==========================================")
+    log("GoldSignalRezaBot - Professional Analyzer")
     log(f"Symbol: {SYMBOL}")
     log(f"Timeframe: {INTERVAL}")
-    log("Checking market every 5 minutes.")
-    log(f"BUY RSI level: {RSI_BUY_LEVEL}")
-    log(f"SELL RSI level: {RSI_SELL_LEVEL}")
-    log("========================================")
-
-    # Basic configuration check
-    if not BOT_TOKEN:
-        log("ERROR: BOT_TOKEN is not configured.")
-    if not CHAT_ID:
-        log("ERROR: CHAT_ID is not configured.")
-    if not API_KEY:
-        log("ERROR: API_KEY is not configured.")
+    log("Signals: BUY / SELL / HOLD")
+    log("Targets: ATR-based TP1 / TP2 / TP3")
+    log("Automatic trading: DISABLED")
+    log("==========================================")
 
     while True:
         try:
             candles = get_candles()
 
             if candles:
-                result = calculate_signal(candles)
+                result = analyze_market(candles)
 
                 if result:
-                    signal = result["signal"]
+                    log(
+                        f"Price={result['price']:.2f} | "
+                        f"EMA9={result['ema9']:.2f} | "
+                        f"EMA21={result['ema21']:.2f} | "
+                        f"RSI={result['rsi']:.2f} | "
+                        f"ATR={result['atr']:.2f}"
+                    )
+                    log(
+                        f"Signal={result['signal']} | "
+                        f"Trend={result['strength']} | "
+                        f"Score={result['score']}/100"
+                    )
 
-                    log(f"Current gold price: {result['price']:.2f}")
-                    log(f"EMA 9: {result['ema9']:.2f}")
-                    log(f"EMA 21: {result['ema21']:.2f}")
-                    log(f"RSI: {result['rsi']:.2f}")
-                    log(f"ATR: {result['atr']:.2f}")
-                    log(f"Signal: {signal}")
-
-                    # Send only when the signal changes.
-                    if signal != last_signal:
-                        message = format_signal(result)
-
-                        if send_message(message):
-                            last_signal = signal
-                            log(f"New signal sent: {signal}")
+                    if result["signal"] != last_signal:
+                        if send_message(format_signal(result)):
+                            last_signal = result["signal"]
                     else:
-                        log(f"Signal unchanged ({signal}). No Telegram message sent.")
+                        log(
+                            f"Signal unchanged ({result['signal']}). "
+                            "No Telegram message sent."
+                        )
 
             time.sleep(CHECK_INTERVAL)
 
