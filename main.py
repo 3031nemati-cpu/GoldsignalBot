@@ -1,7 +1,10 @@
 import os
 import time
-from datetime import datetime, timezone
 import requests
+
+# =========================================================
+# CONFIG
+# =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -9,107 +12,235 @@ API_KEY = os.getenv("API_KEY")
 
 SYMBOL = "XAU/USD"
 INTERVAL = "5min"
-CHECK_INTERVAL = 300
 
-EMA_FAST = 9
-EMA_SLOW = 21
-RSI_PERIOD = 14
-ATR_PERIOD = 14
+CHECK_SECONDS = 300
+CANDLE_COUNT = 100
 
-RSI_BUY = 55
-RSI_SELL = 45
+# Risk / Trade Management
+ATR_SL_MULTIPLIER = 1.5
 
-# حداقل قدرت روند برای BUY/SELL
-MIN_TREND_SCORE = 60
-
-# مدیریت ریسک بر اساس ATR
-SL_ATR = 1.5
 TP1_ATR = 1.0
 TP2_ATR = 2.0
 TP3_ATR = 3.0
 
-# تشخیص شکست حمایت/مقاومت
-BREAKOUT_LOOKBACK = 12
-BREAKOUT_BUFFER_ATR = 0.10
+TRAILING_ATR = 1.2
 
+MIN_TREND_SCORE = 60
+
+TWELVEDATA_URL = "https://api.twelvedata.com/time_series"
+
+TELEGRAM_URL = (
+    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+)
+
+session = requests.Session()
+
+# Current simulated position
+position = None
+
+last_candle_time = None
 last_signal = None
-last_warning = None
 
+
+# =========================================================
+# LOG
+# =========================================================
 
 def log(message):
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"[{now}] {message}", flush=True)
+    print(message, flush=True)
 
 
-def get_candles():
+# =========================================================
+# CHECK VARIABLES
+# =========================================================
+
+def validate_environment():
+
+    missing = []
+
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+
+    if not CHAT_ID:
+        missing.append("CHAT_ID")
+
+    if not API_KEY:
+        missing.append("API_KEY")
+
+    if missing:
+
+        raise RuntimeError(
+            "Missing Railway variables: "
+            + ", ".join(missing)
+        )
+
+
+# =========================================================
+# TELEGRAM
+# =========================================================
+
+def send_telegram(message):
 
     try:
 
-        response = requests.get(
-            "https://api.twelvedata.com/time_series",
-            params={
-                "symbol": SYMBOL,
-                "interval": INTERVAL,
-                "outputsize": 100,
-                "apikey": API_KEY,
-                "format": "JSON",
-                "timezone": "UTC",
+        response = session.post(
+            TELEGRAM_URL,
+            data={
+                "chat_id": CHAT_ID,
+                "text": message
             },
-            timeout=20,
+            timeout=20
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if not data.get("ok"):
+
+            log(
+                f"Telegram API error: {data}"
+            )
+
+            return False
+
+        log("Telegram message sent.")
+
+        return True
+
+    except Exception as error:
+
+        log(
+            f"Telegram send error: {error}"
+        )
+
+        return False
+
+
+# =========================================================
+# GET GOLD CANDLES
+# =========================================================
+
+def get_candles():
+
+    params = {
+
+        "symbol": SYMBOL,
+
+        "interval": INTERVAL,
+
+        "outputsize": CANDLE_COUNT,
+
+        "apikey": API_KEY,
+
+        "format": "JSON"
+    }
+
+    try:
+
+        response = session.get(
+            TWELVEDATA_URL,
+            params=params,
+            timeout=20
         )
 
         data = response.json()
 
-        if data.get("status") == "error":
-            log(f"Twelve Data API Error: {data}")
-            return None
+        if response.status_code != 200:
 
-        values = data.get("values")
+            log(
+                f"TwelveData HTTP error: {data}"
+            )
 
-        if not values or len(values) < 40:
-            log("Not enough candle data.")
-            return None
+            return []
 
-        values.reverse()
+        if "values" not in data:
+
+            log(
+                f"TwelveData API error: {data}"
+            )
+
+            return []
 
         candles = []
 
-        for x in values:
+        for item in data["values"]:
 
-            candles.append({
-                "datetime": x["datetime"],
-                "open": float(x["open"]),
-                "high": float(x["high"]),
-                "low": float(x["low"]),
-                "close": float(x["close"]),
-            })
+            try:
+
+                candles.append({
+
+                    "datetime":
+                        item["datetime"],
+
+                    "open":
+                        float(item["open"]),
+
+                    "high":
+                        float(item["high"]),
+
+                    "low":
+                        float(item["low"]),
+
+                    "close":
+                        float(item["close"])
+                })
+
+            except Exception:
+
+                continue
+
+        candles.sort(
+            key=lambda x: x["datetime"]
+        )
 
         return candles
 
-    except Exception as e:
+    except Exception as error:
 
-        log(f"Market data error: {e}")
-        return None
+        log(
+            f"Market data error: {error}"
+        )
+
+        return []
 
 
-def ema(values, period):
+# =========================================================
+# EMA
+# =========================================================
+
+def calculate_ema(values, period):
 
     if len(values) < period:
+
         return None
 
-    k = 2 / (period + 1)
+    multiplier = 2 / (period + 1)
 
-    result = sum(values[:period]) / period
+    ema_value = (
+        sum(values[:period])
+        / period
+    )
 
-    for value in values[period:]:
-        result = (value - result) * k + result
+    for price in values[period:]:
 
-    return result
+        ema_value = (
+            (price - ema_value)
+            * multiplier
+            + ema_value
+        )
+
+    return ema_value
 
 
-def rsi(values, period=14):
+# =========================================================
+# RSI
+# =========================================================
+
+def calculate_rsi(values, period=14):
 
     if len(values) < period + 1:
+
         return None
 
     gains = []
@@ -117,474 +248,307 @@ def rsi(values, period=14):
 
     for i in range(1, len(values)):
 
-        change = values[i] - values[i - 1]
+        change = (
+            values[i]
+            - values[i - 1]
+        )
 
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
+        gains.append(
+            max(change, 0)
+        )
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+        losses.append(
+            max(-change, 0)
+        )
+
+    average_gain = (
+        sum(gains[:period])
+        / period
+    )
+
+    average_loss = (
+        sum(losses[:period])
+        / period
+    )
 
     for i in range(period, len(gains)):
 
-        avg_gain = (
-            (avg_gain * (period - 1)) + gains[i]
+        average_gain = (
+            (
+                average_gain
+                * (period - 1)
+            )
+            + gains[i]
         ) / period
 
-        avg_loss = (
-            (avg_loss * (period - 1)) + losses[i]
+        average_loss = (
+            (
+                average_loss
+                * (period - 1)
+            )
+            + losses[i]
         ) / period
 
-    if avg_loss == 0:
+    if average_loss == 0:
+
         return 100.0
 
-    rs = avg_gain / avg_loss
+    relative_strength = (
+        average_gain
+        / average_loss
+    )
 
-    return 100 - (100 / (1 + rs))
+    return (
+        100
+        - (
+            100
+            / (1 + relative_strength)
+        )
+    )
 
 
-def atr(candles, period=14):
+# =========================================================
+# ATR
+# =========================================================
+
+def calculate_atr(candles, period=14):
 
     if len(candles) < period + 1:
+
         return None
 
-    trs = []
+    true_ranges = []
 
     for i in range(1, len(candles)):
 
         high = candles[i]["high"]
+
         low = candles[i]["low"]
 
-        previous_close = candles[i - 1]["close"]
+        previous_close = (
+            candles[i - 1]["close"]
+        )
 
         true_range = max(
+
             high - low,
-            abs(high - previous_close),
-            abs(low - previous_close)
+
+            abs(
+                high
+                - previous_close
+            ),
+
+            abs(
+                low
+                - previous_close
+            )
         )
 
-        trs.append(true_range)
-
-    return sum(trs[-period:]) / period
-
-
-def data_is_fresh(candles):
-
-    try:
-
-        candle_time = datetime.strptime(
-            candles[-1]["datetime"],
-            "%Y-%m-%d %H:%M:%S"
-        ).replace(tzinfo=timezone.utc)
-
-        age = (
-            datetime.now(timezone.utc) - candle_time
-        ).total_seconds() / 60
-
-        log(f"Latest candle age: {age:.1f} minutes")
-
-        if age > 30:
-
-            log("Market data is stale. Analysis paused.")
-
-            return False
-
-        return True
-
-    except Exception as e:
-
-        log(f"Freshness check error: {e}")
-
-        return False
-
-
-def trend_strength(
-    price,
-    ema9,
-    ema21,
-    current_rsi,
-    current_atr
-):
-
-    if current_atr <= 0:
-        return "Neutral", 0
-
-    gap_score = min(
-        40,
-        abs(ema9 - ema21) / current_atr * 40
-    )
-
-    price_score = min(
-        30,
-        abs(price - ema9) / current_atr * 30
-    )
-
-    if ema9 > ema21 and current_rsi >= RSI_BUY:
-
-        direction = "Bullish"
-
-        rsi_score = min(
-            30,
-            (current_rsi - 50) * 1.5
+        true_ranges.append(
+            true_range
         )
 
-    elif ema9 < ema21 and current_rsi <= RSI_SELL:
-
-        direction = "Bearish"
-
-        rsi_score = min(
-            30,
-            (50 - current_rsi) * 1.5
-        )
-
-    else:
-
-        direction = "Neutral"
-
-        rsi_score = 0
-
-    score = round(
-        min(
-            100,
-            gap_score + price_score + rsi_score
-        )
+    atr_value = (
+        sum(true_ranges[:period])
+        / period
     )
 
-    if direction == "Bullish":
+    for tr in true_ranges[period:]:
 
-        label = (
-            "Strong Bullish"
-            if score >= 70
-            else "Bullish"
-        )
+        atr_value = (
+            (
+                atr_value
+                * (period - 1)
+            )
+            + tr
+        ) / period
 
-    elif direction == "Bearish":
-
-        label = (
-            "Strong Bearish"
-            if score >= 70
-            else "Bearish"
-        )
-
-    else:
-
-        label = "Neutral"
-
-    return label, score
+    return atr_value
 
 
-def market_structure(candles, current_atr):
-
-    if len(candles) < BREAKOUT_LOOKBACK + 2:
-
-        return "NONE", None, None
-
-    previous = candles[
-        -BREAKOUT_LOOKBACK - 1:-1
-    ]
-
-    resistance = max(
-        c["high"] for c in previous
-    )
-
-    support = min(
-        c["low"] for c in previous
-    )
-
-    price = candles[-1]["close"]
-
-    buffer = current_atr * BREAKOUT_BUFFER_ATR
-
-    if price > resistance + buffer:
-
-        return (
-            "BREAKOUT_UP",
-            support,
-            resistance
-        )
-
-    if price < support - buffer:
-
-        return (
-            "BREAKOUT_DOWN",
-            support,
-            resistance
-        )
-
-    return (
-        "NONE",
-        support,
-        resistance
-    )
-
-
-def detect_false_breakout(candles, current_atr):
-
-    if len(candles) < BREAKOUT_LOOKBACK + 3:
-
-        return False, None
-
-    previous = candles[
-        -BREAKOUT_LOOKBACK - 2:-2
-    ]
-
-    resistance = max(
-        c["high"] for c in previous
-    )
-
-    support = min(
-        c["low"] for c in previous
-    )
-
-    buffer = current_atr * BREAKOUT_BUFFER_ATR
-
-    previous_candle = candles[-2]
-    last_candle = candles[-1]
-
-    if (
-        previous_candle["high"]
-        > resistance + buffer
-        and last_candle["close"]
-        < resistance
-    ):
-
-        return True, "FALSE_BREAKOUT_UP"
-
-    if (
-        previous_candle["low"]
-        < support - buffer
-        and last_candle["close"]
-        > support
-    ):
-
-        return True, "FALSE_BREAKOUT_DOWN"
-
-    return False, None
-
+# =========================================================
+# ANALYZE MARKET
+# =========================================================
 
 def analyze_market(candles):
-
-    if len(candles) < 40:
-        return None
-
-    if not data_is_fresh(candles):
-        return None
 
     closes = [
         candle["close"]
         for candle in candles
     ]
 
-    price = closes[-1]
-
-    ema9 = ema(
+    ema9 = calculate_ema(
         closes,
-        EMA_FAST
+        9
     )
 
-    ema21 = ema(
+    ema21 = calculate_ema(
         closes,
-        EMA_SLOW
+        21
     )
 
-    current_rsi = rsi(
+    rsi = calculate_rsi(
         closes,
-        RSI_PERIOD
+        14
     )
 
-    current_atr = atr(
+    atr = calculate_atr(
         candles,
-        ATR_PERIOD
+        14
     )
 
     if None in (
         ema9,
         ema21,
-        current_rsi,
-        current_atr
+        rsi,
+        atr
     ):
 
         return None
 
-    trend, score = trend_strength(
-        price,
-        ema9,
-        ema21,
-        current_rsi,
-        current_atr
+    price = closes[-1]
+
+    recent = candles[-20:]
+
+    support = min(
+        candle["low"]
+        for candle in recent
     )
 
-    structure, support, resistance = market_structure(
-        candles,
-        current_atr
+    resistance = max(
+        candle["high"]
+        for candle in recent
     )
 
-    false_breakout, false_type = detect_false_breakout(
-        candles,
-        current_atr
+    # =====================================================
+    # TREND SCORE
+    # =====================================================
+
+    score = 50
+
+    # EMA direction
+    if ema9 > ema21:
+
+        score += 15
+
+    else:
+
+        score -= 15
+
+    # Price relative to EMA9
+    if price > ema9:
+
+        score += 10
+
+    else:
+
+        score -= 10
+
+    # RSI
+    if rsi >= 55:
+
+        score += 15
+
+    elif rsi <= 45:
+
+        score -= 15
+
+    else:
+
+        score += int(
+            (rsi - 50) * 1.5
+        )
+
+    # EMA distance
+    ema_distance = (
+        abs(ema9 - ema21)
+        / atr
     )
 
-    # =========================
-    # BUY / SELL / HOLD
-    # =========================
+    if ema_distance >= 0.75:
+
+        if ema9 > ema21:
+
+            score += 10
+
+        else:
+
+            score -= 10
+
+    score = max(
+        0,
+        min(100, score)
+    )
+
+    # =====================================================
+    # SIGNAL
+    # =====================================================
 
     if (
-        ema9 > ema21
+
+        score >= MIN_TREND_SCORE
+
+        and ema9 > ema21
+
         and price > ema9
-        and current_rsi >= RSI_BUY
-        and score >= MIN_TREND_SCORE
-        and not false_breakout
+
+        and rsi >= 52
+
     ):
 
         signal = "BUY"
 
+        if score >= 75:
+
+            trend = "Strong Bullish"
+
+        else:
+
+            trend = "Bullish"
+
     elif (
-        ema9 < ema21
+
+        score <= 100 - MIN_TREND_SCORE
+
+        and ema9 < ema21
+
         and price < ema9
-        and current_rsi <= RSI_SELL
-        and score >= MIN_TREND_SCORE
-        and not false_breakout
+
+        and rsi <= 48
+
     ):
 
         signal = "SELL"
+
+        if score <= 25:
+
+            trend = "Strong Bearish"
+
+        else:
+
+            trend = "Bearish"
 
     else:
 
         signal = "HOLD"
 
-    # =========================
-    # TARGETS
-    # =========================
+        trend = "Neutral"
 
-    if signal == "BUY":
+    # =====================================================
+    # CAUTION ZONE
+    # =====================================================
 
-        entry = price
-
-        stop = (
-            entry
-            - SL_ATR * current_atr
-        )
-
-        tp1 = (
-            entry
-            + TP1_ATR * current_atr
-        )
-
-        tp2 = (
-            entry
-            + TP2_ATR * current_atr
-        )
-
-        tp3 = (
-            entry
-            + TP3_ATR * current_atr
-        )
-
-    elif signal == "SELL":
-
-        entry = price
-
-        stop = (
-            entry
-            + SL_ATR * current_atr
-        )
-
-        tp1 = (
-            entry
-            - TP1_ATR * current_atr
-        )
-
-        tp2 = (
-            entry
-            - TP2_ATR * current_atr
-        )
-
-        tp3 = (
-            entry
-            - TP3_ATR * current_atr
-        )
-
-    else:
-
-        entry = None
-        stop = None
-        tp1 = None
-        tp2 = None
-        tp3 = None
-
-    # =========================
-    # REVERSAL ZONE
-    # =========================
-
-    reversal_width = max(
-        current_atr * 0.50,
-        abs(ema9 - ema21)
+    caution_low = (
+        ema21
+        - (0.5 * atr)
     )
 
-    reversal_low = (
-        ema21 - reversal_width
+    caution_high = (
+        ema21
+        + (0.5 * atr)
     )
-
-    reversal_high = (
-        ema21 + reversal_width
-    )
-
-    # =========================
-    # TREND WEAKENING
-    # =========================
-
-    weakening = False
-    weakening_reason = ""
-
-    if signal == "BUY":
-
-        if price < ema9:
-
-            weakening = True
-            weakening_reason = (
-                "Price dropped below EMA9."
-            )
-
-        elif current_rsi < RSI_BUY:
-
-            weakening = True
-            weakening_reason = (
-                "RSI lost bullish confirmation."
-            )
-
-        elif ema9 <= ema21:
-
-            weakening = True
-            weakening_reason = (
-                "EMA trend weakened."
-            )
-
-    elif signal == "SELL":
-
-        if price > ema9:
-
-            weakening = True
-            weakening_reason = (
-                "Price moved above EMA9."
-            )
-
-        elif current_rsi > RSI_SELL:
-
-            weakening = True
-            weakening_reason = (
-                "RSI lost bearish confirmation."
-            )
-
-        elif ema9 >= ema21:
-
-            weakening = True
-            weakening_reason = (
-                "EMA trend weakened."
-            )
 
     return {
-
-        "signal": signal,
 
         "price": price,
 
@@ -592,27 +556,98 @@ def analyze_market(candles):
 
         "ema21": ema21,
 
-        "rsi": current_rsi,
+        "rsi": rsi,
 
-        "atr": current_atr,
-
-        "trend": trend,
+        "atr": atr,
 
         "score": score,
 
-        "structure": structure,
+        "signal": signal,
+
+        "trend": trend,
 
         "support": support,
 
         "resistance": resistance,
 
-        "false_breakout": false_breakout,
+        "caution_low":
+            caution_low,
 
-        "false_type": false_type,
+        "caution_high":
+            caution_high,
 
-        "entry": entry,
+        "candle":
+            candles[-1]["datetime"]
+    }
 
-        "stop": stop,
+
+# =========================================================
+# CREATE TP / SL
+# =========================================================
+
+def create_levels(info):
+
+    price = info["price"]
+
+    atr = info["atr"]
+
+    signal = info["signal"]
+
+    if signal == "BUY":
+
+        stop_loss = (
+            price
+            - ATR_SL_MULTIPLIER * atr
+        )
+
+        tp1 = (
+            price
+            + TP1_ATR * atr
+        )
+
+        tp2 = (
+            price
+            + TP2_ATR * atr
+        )
+
+        tp3 = (
+            price
+            + TP3_ATR * atr
+        )
+
+    elif signal == "SELL":
+
+        stop_loss = (
+            price
+            + ATR_SL_MULTIPLIER * atr
+        )
+
+        tp1 = (
+            price
+            - TP1_ATR * atr
+        )
+
+        tp2 = (
+            price
+            - TP2_ATR * atr
+        )
+
+        tp3 = (
+            price
+            - TP3_ATR * atr
+        )
+
+    else:
+
+        return None
+
+    return {
+
+        "side": signal,
+
+        "entry": price,
+
+        "sl": stop_loss,
 
         "tp1": tp1,
 
@@ -620,213 +655,539 @@ def analyze_market(candles):
 
         "tp3": tp3,
 
-        "reversal_low": reversal_low,
+        "tp1_hit": False,
 
-        "reversal_high": reversal_high,
+        "tp2_hit": False,
 
-        "weakening": weakening,
+        "tp3_hit": False,
 
-        "weakening_reason": weakening_reason,
+        "break_even": False,
 
-        "candle_time": candles[-1]["datetime"]
+        "trail": stop_loss,
 
+        "opened_candle":
+            info["candle"]
     }
 
 
-def format_signal(result):
+# =========================================================
+# FORMAT PRICE
+# =========================================================
 
-    if result["signal"] == "BUY":
+def price_format(value):
 
-        title = "🟢 GOLD SIGNAL — BUY"
+    return f"{value:.2f}"
 
-    elif result["signal"] == "SELL":
 
-        title = "🔴 GOLD SIGNAL — SELL"
+# =========================================================
+# SIGNAL MESSAGE
+# =========================================================
+
+def build_signal_message(
+    info,
+    levels=None
+):
+
+    signal = info["signal"]
+
+    if signal == "BUY":
+
+        icon = "🟢"
+
+    elif signal == "SELL":
+
+        icon = "🔴"
 
     else:
 
-        title = "⚪ GOLD SIGNAL — HOLD"
+        icon = "⚪"
 
-    text = (
+    message = (
 
-        f"{title}\n\n"
+        f"{icon} GOLD SIGNAL — {signal}\n"
 
         f"Symbol: {SYMBOL}\n"
+
         f"Timeframe: {INTERVAL}\n"
-        f"Price: {result['price']:.2f}\n\n"
 
-        f"📊 Trend: {result['trend']}\n"
-        f"Trend Score: {result['score']}/100\n\n"
+        f"Price: "
+        f"{price_format(info['price'])}\n"
 
-        f"EMA 9: {result['ema9']:.2f}\n"
-        f"EMA 21: {result['ema21']:.2f}\n"
-        f"RSI: {result['rsi']:.2f}\n"
-        f"ATR: {result['atr']:.2f}\n"
+        f"📊 Trend: "
+        f"{info['trend']}\n"
+
+        f"Trend Score: "
+        f"{info['score']}/100\n"
+
+        f"EMA 9: "
+        f"{price_format(info['ema9'])}\n"
+
+        f"EMA 21: "
+        f"{price_format(info['ema21'])}\n"
+
+        f"RSI: "
+        f"{info['rsi']:.2f}\n"
+
+        f"ATR: "
+        f"{price_format(info['atr'])}\n"
     )
 
-    if result["signal"] in (
-        "BUY",
-        "SELL"
-    ):
+    if levels:
 
-        text += (
+        message += (
 
-            f"\n💰 Entry: "
-            f"{result['entry']:.2f}\n"
+            f"💰 Entry: "
+            f"{price_format(levels['entry'])}\n"
 
             f"🎯 TP1: "
-            f"{result['tp1']:.2f}\n"
+            f"{price_format(levels['tp1'])}\n"
 
             f"🎯 TP2: "
-            f"{result['tp2']:.2f}\n"
+            f"{price_format(levels['tp2'])}\n"
 
             f"🎯 TP3: "
-            f"{result['tp3']:.2f}\n"
+            f"{price_format(levels['tp3'])}\n"
 
             f"🛑 Stop Loss: "
-            f"{result['stop']:.2f}\n"
+            f"{price_format(levels['sl'])}\n"
         )
 
-    if result["support"] is not None:
+    message += (
 
-        text += (
+        f"📉 Support: "
+        f"{price_format(info['support'])}\n"
 
-            f"\n📉 Support: "
-            f"{result['support']:.2f}\n"
+        f"📈 Resistance: "
+        f"{price_format(info['resistance'])}\n"
 
-            f"📈 Resistance: "
-            f"{result['resistance']:.2f}\n"
-        )
+        f"🔄 Reversal/Caution Zone: "
 
-    text += (
+        f"{price_format(info['caution_low'])}"
 
-        f"\n🔄 Reversal/Caution Zone:\n"
-
-        f"{result['reversal_low']:.2f}"
         f" - "
-        f"{result['reversal_high']:.2f}\n"
+
+        f"{price_format(info['caution_high'])}\n"
+
+        f"Candle: "
+        f"{info['candle']}\n"
+
+        f"⚠️ Technical analysis only — "
+        f"not an automatic trade."
     )
 
-    if result["structure"] == "BREAKOUT_UP":
-
-        text += (
-            "\n🚀 Breakout: UP\n"
-        )
-
-    elif result["structure"] == "BREAKOUT_DOWN":
-
-        text += (
-            "\n📉 Breakout: DOWN\n"
-        )
-
-    if result["false_breakout"]:
-
-        text += (
-
-            "\n⚠️ Possible FALSE BREAKOUT "
-            "detected.\n"
-
-            "Wait for confirmation.\n"
-        )
-
-    if result["weakening"]:
-
-        text += (
-
-            "\n⚠️ TREND WEAKENING\n"
-
-            f"{result['weakening_reason']}\n"
-        )
-
-    text += (
-
-        f"\nCandle: "
-        f"{result['candle_time']}\n"
-
-        "⚠️ Technical analysis only — "
-        "not an automatic trade."
-    )
-
-    return text
+    return message
 
 
-def send_message(text):
+# =========================================================
+# MANAGE SIMULATED POSITION
+# =========================================================
 
-    if not BOT_TOKEN:
+def manage_position(info):
 
-        log(
-            "ERROR: BOT_TOKEN is missing."
-        )
+    global position
 
-        return False
+    if position is None:
 
-    if not CHAT_ID:
+        return
 
-        log(
-            "ERROR: CHAT_ID is missing."
-        )
+    side = position["side"]
 
-        return False
+    price = info["price"]
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{BOT_TOKEN}/sendMessage"
-    )
+    atr = info["atr"]
 
-    try:
+    # =====================================================
+    # BUY MANAGEMENT
+    # =====================================================
 
-        response = requests.post(
-
-            url,
-
-            data={
-                "chat_id": CHAT_ID,
-                "text": text
-            },
-
-            timeout=20
-        )
-
-        data = response.json()
+    if side == "BUY":
 
         if (
-            response.ok
-            and data.get("ok")
+            price >= position["tp3"]
+            and not position["tp3_hit"]
         ):
 
-            log(
-                "Telegram message sent."
+            position["tp3_hit"] = True
+
+            send_telegram(
+
+                "🏁 TP3 HIT — BUY\n"
+
+                f"Price: "
+                f"{price_format(price)}\n"
+
+                f"Entry: "
+                f"{price_format(position['entry'])}\n"
+
+                f"TP3: "
+                f"{price_format(position['tp3'])}\n"
+
+                "📌 Simulation position closed."
             )
 
-            return True
+            position = None
+
+            return
+
+        if (
+            price >= position["tp2"]
+            and not position["tp2_hit"]
+        ):
+
+            position["tp2_hit"] = True
+
+            send_telegram(
+
+                "✅ TP2 HIT — BUY\n"
+
+                f"Price: "
+                f"{price_format(price)}\n"
+
+                f"TP2: "
+                f"{price_format(position['tp2'])}"
+            )
+
+        if (
+            price >= position["tp1"]
+            and not position["tp1_hit"]
+        ):
+
+            position["tp1_hit"] = True
+
+            position["break_even"] = True
+
+            position["trail"] = max(
+
+                position["trail"],
+
+                position["entry"]
+            )
+
+            send_telegram(
+
+                "✅ TP1 HIT — BUY\n"
+
+                f"Price: "
+                f"{price_format(price)}\n"
+
+                f"TP1: "
+                f"{price_format(position['tp1'])}\n"
+
+                "🔒 Stop Loss moved to "
+                "BREAK-EVEN\n"
+
+                f"New SL: "
+                f"{price_format(position['entry'])}"
+            )
+
+        # Trailing stop after TP1
+        if position["tp1_hit"]:
+
+            new_trail = (
+                price
+                - TRAILING_ATR * atr
+            )
+
+            if new_trail > position["trail"]:
+
+                position["trail"] = new_trail
+
+        # Stop / trailing hit
+        if price <= position["trail"]:
+
+            send_telegram(
+
+                "🛑 STOP / TRAILING HIT — BUY\n"
+
+                f"Price: "
+                f"{price_format(price)}\n"
+
+                f"Exit: "
+                f"{price_format(position['trail'])}\n"
+
+                "📌 Simulation position closed."
+            )
+
+            position = None
+
+    # =====================================================
+    # SELL MANAGEMENT
+    # =====================================================
+
+    elif side == "SELL":
+
+        if (
+            price <= position["tp3"]
+            and not position["tp3_hit"]
+        ):
+
+            position["tp3_hit"] = True
+
+            send_telegram(
+
+                "🏁 TP3 HIT — SELL\n"
+
+                f"Price: "
+                f"{price_format(price)}\n"
+
+                f"Entry: "
+                f"{price_format(position['entry'])}\n"
+
+                f"TP3: "
+                f"{price_format(position['tp3'])}\n"
+
+                "📌 Simulation position closed."
+            )
+
+            position = None
+
+            return
+
+        if (
+            price <= position["tp2"]
+            and not position["tp2_hit"]
+        ):
+
+            position["tp2_hit"] = True
+
+            send_telegram(
+
+                "✅ TP2 HIT — SELL\n"
+
+                f"Price: "
+                f"{price_format(price)}\n"
+
+                f"TP2: "
+                f"{price_format(position['tp2'])}"
+            )
+
+        if (
+            price <= position["tp1"]
+            and not position["tp1_hit"]
+        ):
+
+            position["tp1_hit"] = True
+
+            position["break_even"] = True
+
+            position["trail"] = min(
+
+                position["trail"],
+
+                position["entry"]
+            )
+
+            send_telegram(
+
+                "✅ TP1 HIT — SELL\n"
+
+                f"Price: "
+                f"{price_format(price)}\n"
+
+                f"TP1: "
+                f"{price_format(position['tp1'])}\n"
+
+                "🔒 Stop Loss moved to "
+                "BREAK-EVEN\n"
+
+                f"New SL: "
+                f"{price_format(position['entry'])}"
+            )
+
+        # Trailing stop
+        if position["tp1_hit"]:
+
+            new_trail = (
+                price
+                + TRAILING_ATR * atr
+            )
+
+            if new_trail < position["trail"]:
+
+                position["trail"] = new_trail
+
+        # Stop / trailing hit
+        if price >= position["trail"]:
+
+            send_telegram(
+
+                "🛑 STOP / TRAILING HIT — SELL\n"
+
+                f"Price: "
+                f"{price_format(price)}\n"
+
+                f"Exit: "
+                f"{price_format(position['trail'])}\n"
+
+                "📌 Simulation position closed."
+            )
+
+            position = None
+
+
+# =========================================================
+# PROCESS MARKET
+# =========================================================
+
+def process_market():
+
+    global position
+    global last_candle_time
+    global last_signal
+
+    candles = get_candles()
+
+    if len(candles) < 30:
 
         log(
-            f"Telegram API Error: {data}"
+            "Not enough candle data."
         )
 
-        return False
+        return
 
-    except Exception as e:
+    info = analyze_market(
+        candles
+    )
+
+    if not info:
 
         log(
-            f"Telegram connection error: {e}"
+            "Indicators not ready."
         )
 
-        return False
+        return
 
+    log(
+
+        f"Current gold price: "
+        f"{price_format(info['price'])}"
+    )
+
+    log(
+
+        f"Signal: "
+        f"{info['signal']}"
+    )
+
+    log(
+
+        f"Trend Score: "
+        f"{info['score']}/100"
+    )
+
+    log(
+
+        f"EMA 9: "
+        f"{price_format(info['ema9'])}"
+    )
+
+    log(
+
+        f"EMA 21: "
+        f"{price_format(info['ema21'])}"
+    )
+
+    log(
+
+        f"RSI: "
+        f"{info['rsi']:.2f}"
+    )
+
+    log(
+
+        f"ATR: "
+        f"{price_format(info['atr'])}"
+    )
+
+    # Manage existing simulated trade
+    manage_position(info)
+
+    new_candle = (
+        info["candle"]
+        != last_candle_time
+    )
+
+    # =====================================================
+    # NEW BUY / SELL
+    # =====================================================
+
+    if (
+
+        position is None
+
+        and info["signal"]
+        in ("BUY", "SELL")
+
+        and new_candle
+
+    ):
+
+        position = create_levels(
+            info
+        )
+
+        send_telegram(
+
+            build_signal_message(
+                info,
+                position
+            )
+        )
+
+        last_signal = (
+            info["signal"]
+        )
+
+    # =====================================================
+    # HOLD
+    # =====================================================
+
+    elif (
+
+        position is None
+
+        and info["signal"]
+        == "HOLD"
+
+        and new_candle
+
+    ):
+
+        # Only send HOLD when signal changes
+        if last_signal != "HOLD":
+
+            send_telegram(
+
+                build_signal_message(
+                    info
+                )
+            )
+
+        last_signal = "HOLD"
+
+    last_candle_time = (
+        info["candle"]
+    )
+
+
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
 
-    global last_signal
-    global last_warning
+    validate_environment()
 
     log(
-        "=========================================="
+        "================================"
     )
 
     log(
-        "GoldSignalRezaBot - "
-        "Professional Analyzer v2"
+        "GOLD SIGNAL BOT STARTED"
+    )
+
+    log(
+        "================================"
     )
 
     log(
@@ -838,170 +1199,70 @@ def main():
     )
 
     log(
-        f"Minimum Trend Score: "
-        f"{MIN_TREND_SCORE}/100"
+        "Checking market every 5 minutes."
     )
 
     log(
-        "Breakout + False Breakout: ON"
+        "BUY / SELL / HOLD: ENABLED"
     )
 
     log(
-        "Trend Weakening Alerts: ON"
+        "TP1 / TP2 / TP3: ENABLED"
     )
 
     log(
-        "Automatic trading: DISABLED"
+        "Break-even: ENABLED"
     )
 
     log(
-        "=========================================="
+        "Trailing Stop: ENABLED"
+    )
+
+    log(
+        "Real trading: DISABLED"
+    )
+
+    send_telegram(
+
+        "🤖 GOLD SIGNAL BOT ONLINE\n\n"
+
+        f"Symbol: {SYMBOL}\n"
+
+        f"Timeframe: {INTERVAL}\n"
+
+        "BUY / SELL / HOLD: ON\n"
+
+        "TP1 / TP2 / TP3: ON\n"
+
+        "Break-even: ON\n"
+
+        "Trailing Stop: ON\n\n"
+
+        "🧪 Mode: SIMULATION\n"
+
+        "⚠️ No real order will be placed."
     )
 
     while True:
 
         try:
 
-            candles = get_candles()
+            process_market()
 
-            if candles:
-
-                result = analyze_market(
-                    candles
-                )
-
-                if result:
-
-                    log(
-
-                        f"Price="
-                        f"{result['price']:.2f} | "
-
-                        f"EMA9="
-                        f"{result['ema9']:.2f} | "
-
-                        f"EMA21="
-                        f"{result['ema21']:.2f} | "
-
-                        f"RSI="
-                        f"{result['rsi']:.2f} | "
-
-                        f"ATR="
-                        f"{result['atr']:.2f}"
-                    )
-
-                    log(
-
-                        f"Signal="
-                        f"{result['signal']} | "
-
-                        f"Trend="
-                        f"{result['trend']} | "
-
-                        f"Score="
-                        f"{result['score']}/100 | "
-
-                        f"Structure="
-                        f"{result['structure']}"
-                    )
-
-                    if result["false_breakout"]:
-
-                        log(
-
-                            "Possible false breakout: "
-
-                            f"{result['false_type']}"
-                        )
-
-                    # ارسال پیام فقط هنگام تغییر سیگنال
-                    if (
-                        result["signal"]
-                        != last_signal
-                    ):
-
-                        if send_message(
-                            format_signal(result)
-                        ):
-
-                            last_signal = (
-                                result["signal"]
-                            )
-
-                            last_warning = None
-
-                    # هشدار ضعیف شدن روند
-                    elif (
-
-                        result["weakening"]
-
-                        and result["signal"]
-                        in ("BUY", "SELL")
-
-                        and result[
-                            "weakening_reason"
-                        ]
-                        != last_warning
-
-                    ):
-
-                        warning = (
-
-                            "⚠️ GOLD TREND WARNING\n\n"
-
-                            f"Symbol: {SYMBOL}\n"
-
-                            f"Timeframe: {INTERVAL}\n"
-
-                            f"Price: "
-                            f"{result['price']:.2f}\n"
-
-                            f"Trend: "
-                            f"{result['trend']}\n"
-
-                            f"Score: "
-                            f"{result['score']}/100\n\n"
-
-                            "Reason:\n"
-
-                            f"{result['weakening_reason']}\n\n"
-
-                            "⚠️ Momentum may be "
-                            "weakening. "
-                            "Wait for confirmation."
-                        )
-
-                        if send_message(
-                            warning
-                        ):
-
-                            last_warning = (
-                                result[
-                                    "weakening_reason"
-                                ]
-                            )
-
-                    else:
-
-                        log(
-
-                            f"Signal unchanged "
-                            f"({result['signal']}). "
-                            "No Telegram message sent."
-                        )
-
-            time.sleep(
-                CHECK_INTERVAL
-            )
-
-        except Exception as e:
+        except Exception as error:
 
             log(
-                f"Main loop error: {e}"
+                f"Main loop error: {error}"
             )
 
-            time.sleep(60)
+        time.sleep(
+            CHECK_SECONDS
+        )
 
+
+# =========================================================
+# START
+# =========================================================
 
 if __name__ == "__main__":
 
