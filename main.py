@@ -20,10 +20,10 @@ API_KEY = os.getenv("API_KEY")
 SYMBOL = "XAU/USD"
 INTERVAL = "5min"
 
-CHECK_SECONDS = 60
-MIN_TREND_SCORE = 60
+CHECK_SECONDS = 30
+MIN_TREND_SCORE = 55
 MAX_CANDLE_AGE_MINUTES = 8
-CONFIRMATION_REQUIRED = 2
+CONFIRMATION_REQUIRED = 1
 
 TP1_ATR = 1.0
 TP2_ATR = 2.0
@@ -51,6 +51,7 @@ session.headers.update({"User-Agent": "GoldSignalBot/Professional"})
 
 last_processed_candle = None
 last_sent_signal = None
+last_sent_candle = None
 
 
 def send_telegram(message):
@@ -306,30 +307,22 @@ def calculate_analysis(candles):
 
 
 def confirm_signal(candles, analysis):
-    c1, c2 = candles[-2], candles[-1]
+    # The latest candle is already CLOSED.
+    # We no longer require two candles with identical colors.
+    # Instead, the professional score is built from EMA, price position,
+    # EMA momentum, RSI and the latest closed candle direction.
 
-    bull_count = sum([
-        c1["close"] > c1["open"],
-        c2["close"] > c2["open"]
-    ])
-    bear_count = sum([
-        c1["close"] < c1["open"],
-        c2["close"] < c2["open"]
-    ])
+    latest = candles[-1]
+    bullish_candle = latest["close"] > latest["open"]
+    bearish_candle = latest["close"] < latest["open"]
 
-    if (
-        analysis["bull"] > analysis["bear"]
-        and bull_count >= CONFIRMATION_REQUIRED
-    ):
-        return "BUY", bull_count
+    if analysis["bull"] > analysis["bear"] and bullish_candle:
+        return "BUY", 1
 
-    if (
-        analysis["bear"] > analysis["bull"]
-        and bear_count >= CONFIRMATION_REQUIRED
-    ):
-        return "SELL", bear_count
+    if analysis["bear"] > analysis["bull"] and bearish_candle:
+        return "SELL", 1
 
-    return "HOLD", max(bull_count, bear_count)
+    return "HOLD", 0
 
 
 def levels(signal, price, a, support, resistance):
@@ -400,7 +393,7 @@ Not automatic trading."""
 
 
 def analyze():
-    global last_processed_candle, last_sent_signal
+    global last_processed_candle, last_sent_signal, last_sent_candle
 
     candles = get_candles()
     if len(candles) < 30:
@@ -415,18 +408,17 @@ def analyze():
     latest = closed[-1]
     candle_id = latest["datetime"].isoformat()
 
+    # One analysis per closed 5-minute candle.
     if candle_id == last_processed_candle:
-        log.info("Same closed candle already processed.")
         return
 
     age = candle_age_minutes(latest)
-    log.info("Closed candle age: %.2f minutes", age)
+    log.info("New CLOSED candle detected | age=%.2f min", age)
 
     if age > MAX_CANDLE_AGE_MINUTES:
-        log.warning("Closed candle is too old.")
+        log.warning("Candle rejected as stale.")
+        last_processed_candle = candle_id
         return
-
-    last_processed_candle = candle_id
 
     x = calculate_analysis(closed)
     if not x:
@@ -444,37 +436,56 @@ def analyze():
         x["price"], x["ema9"], x["ema21"], x["rsi"], x["atr"]
     )
     log.info(
-        "Signal=%s | Trend=%s | Score=%d | Confirmation=%d/2",
+        "Signal=%s | Trend=%s | Score=%d | Confirmation=%d/1",
         signal, x["trend"], x["score"], confirmation_count
     )
 
+    # The candle is considered processed only after all checks.
+    # If Telegram fails, we deliberately leave it unprocessed so
+    # the next cycle can retry the same signal.
     if signal == "HOLD":
-        log.info("HOLD suppressed. No Telegram HOLD message.")
+        log.info("No actionable signal on this closed candle.")
+        last_processed_candle = candle_id
         return
 
     if x["score"] < MIN_TREND_SCORE:
-        log.info("Signal rejected: score below minimum.")
+        log.info(
+            "Signal rejected: score %d below minimum %d.",
+            x["score"], MIN_TREND_SCORE
+        )
+        last_processed_candle = candle_id
         return
 
     if signal == "BUY" and x["bull"] <= x["bear"]:
+        last_processed_candle = candle_id
         return
 
     if signal == "SELL" and x["bear"] <= x["bull"]:
-        return
-
-    # Prevent repeated BUY/BUY or SELL/SELL Telegram messages.
-    if signal == last_sent_signal:
-        log.info("Same signal direction already sent: %s", signal)
+        last_processed_candle = candle_id
         return
 
     lv = levels(signal, x["price"], x["atr"], support, resistance)
     if not lv:
+        last_processed_candle = candle_id
         return
 
+    # IMPORTANT:
+    # Same-direction signals are allowed again on a NEW closed candle.
+    # This fixes the previous "one BUY then silence" problem.
     message = build_message(signal, x, lv, confirmation_count)
 
     if send_telegram(message):
         last_sent_signal = signal
+        last_sent_candle = candle_id
+        last_processed_candle = candle_id
+        log.info(
+            "Signal delivered | direction=%s | candle=%s",
+            signal, candle_id
+        )
+    else:
+        log.warning(
+            "Telegram failed. Candle will be retried on the next cycle."
+        )
 
 
 def startup():
@@ -484,9 +495,12 @@ def startup():
     log.info("Symbol: %s", SYMBOL)
     log.info("Timeframe: %s", INTERVAL)
     log.info("Minimum Trend Score: %d/100", MIN_TREND_SCORE)
+    log.info("Scan interval: %d seconds", CHECK_SECONDS)
     log.info("Maximum Candle Age: %d minutes", MAX_CANDLE_AGE_MINUTES)
     log.info("Closed Candle Protection: ON")
     log.info("Duplicate Candle Protection: ON")
+    log.info("Same-direction signal updates: ON")
+    log.info("Telegram retry on failure: ON")
     log.info("HOLD Messages: OFF")
     log.info("Automatic Trading: DISABLED")
     log.info("Telegram timestamps: OFF")
