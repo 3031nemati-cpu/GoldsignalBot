@@ -6,31 +6,15 @@ from datetime import datetime, timezone
 import requests
 
 # ============================================================
-# GOLD SIGNAL BOT - PROFESSIONAL PERSIAN VERSION
+# GOLD SIGNAL BOT - STRONG SIGNAL MODE
 # ============================================================
-# ویژگی‌ها:
-# - XAU/USD
-# - تایم‌فریم 5 دقیقه
-# - بررسی هر 30 ثانیه
-# - فقط استفاده از کندل بسته‌شده
-# - ارسال سیگنال جدید در هر کندل بسته‌شده
-# - EMA 9 / EMA 21
-# - RSI
-# - ATR
-# - Trend Score
-# - Support / Resistance
-# - TP1 / TP2 / TP3
-# - Stop Loss
-# - جلوگیری از ارسال تکراری برای همان کندل
-# - پیام‌های HOLD خاموش
-# - معاملات خودکار خاموش
-# - پیام تلگرام کاملاً فارسی
-# - بدون نمایش ساعت UTC و تهران در پیام تلگرام
-# ============================================================
-
-
-# ============================================================
-# CONFIGURATION
+# هدف این نسخه:
+# - سیگنال کمتر، اما قوی‌تر و کنترل‌شده‌تر
+# - فقط تحلیل کندل 5 دقیقه‌ای کاملاً بسته‌شده
+# - حذف زمان UTC/تهران از پیام تلگرام
+# - حذف پیام‌های HOLD
+# - جلوگیری از سیگنال‌های تکراری و ضعیف
+# - معاملات خودکار فعلاً خاموش است
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -40,25 +24,34 @@ API_KEY = os.getenv("API_KEY")
 SYMBOL = "XAU/USD"
 INTERVAL = "5min"
 
-# بررسی بازار هر 30 ثانیه
-CHECK_SECONDS = 30
+# هر 60 ثانیه داده بررسی می‌شود، اما فقط با تشکیل
+# کندل 5 دقیقه‌ای جدید یک تحلیل جدید انجام می‌شود.
+CHECK_SECONDS = 60
 
-# حداقل امتیاز لازم برای صدور سیگنال
-MIN_TREND_SCORE = 55
+# فیلتر اصلی کیفیت
+MIN_SIGNAL_SCORE = 70
+MIN_SCORE_MARGIN = 10
 
-# حداکثر عمر مجاز کندل
-MAX_CANDLE_AGE_MINUTES = 8
+# حداکثر سن مجاز آخرین کندل بسته‌شده
+MAX_CANDLE_AGE_MINUTES = 7
 
-# تنظیمات تارگت و حد ضرر بر اساس ATR
+EMA_FAST = 9
+EMA_SLOW = 21
+RSI_PERIOD = 14
+ATR_PERIOD = 14
+
+# اهداف و حد ضرر بر اساس ATR
 TP1_ATR = 1.0
 TP2_ATR = 2.0
 TP3_ATR = 3.0
 SL_ATR = 1.5
 
-# وضعیت معاملات خودکار
-AUTOMATIC_TRADING = False
+# جلوگیری از ورود در ATR غیرعادی
+MIN_ATR = 0.10
+MAX_ATR = 20.0
 
-# ارسال HOLD خاموش
+# فعلاً خاموش؛ بعد از تست دمو می‌توان فعال کرد.
+AUTOMATIC_TRADING = False
 SEND_HOLD_MESSAGES = False
 
 
@@ -68,24 +61,23 @@ SEND_HOLD_MESSAGES = False
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s UTC | %(levelname)s | %(message)s"
+    format="%(asctime)s UTC | %(levelname)s | %(message)s",
 )
 
 log = logging.getLogger("GoldSignalBot")
 
 
 # ============================================================
-# CHECK ENVIRONMENT VARIABLES
+# ENVIRONMENT CHECK
 # ============================================================
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing")
-
-if not CHAT_ID:
-    raise RuntimeError("CHAT_ID is missing")
-
-if not API_KEY:
-    raise RuntimeError("API_KEY is missing")
+for name, value in (
+    ("BOT_TOKEN", BOT_TOKEN),
+    ("CHAT_ID", CHAT_ID),
+    ("API_KEY", API_KEY),
+):
+    if not value:
+        raise RuntimeError(f"{name} is missing")
 
 
 # ============================================================
@@ -93,19 +85,21 @@ if not API_KEY:
 # ============================================================
 
 session = requests.Session()
-
-session.headers.update({
-    "User-Agent": "GoldSignalBot/Professional"
-})
+session.headers.update(
+    {"User-Agent": "GoldSignalBot/StrongSignals/2.0"}
+)
 
 
 # ============================================================
-# SIGNAL MEMORY
+# MEMORY
 # ============================================================
 
 last_processed_candle = None
+
 last_sent_signal = None
 last_sent_candle = None
+last_sent_price = None
+last_sent_score = None
 
 
 # ============================================================
@@ -113,18 +107,16 @@ last_sent_candle = None
 # ============================================================
 
 def send_telegram(message):
-
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     try:
-
         response = session.post(
             url,
             data={
                 "chat_id": CHAT_ID,
-                "text": message
+                "text": message,
             },
-            timeout=20
+            timeout=20,
         )
 
         response.raise_for_status()
@@ -135,22 +127,20 @@ def send_telegram(message):
             log.error("Telegram error: %s", data)
             return False
 
-        log.info("Telegram message sent successfully.")
-
+        log.info("Telegram signal sent.")
         return True
 
-    except Exception as e:
-
-        log.error("Telegram error: %s", e)
-
+    except Exception as exc:
+        log.error("Telegram error: %s", exc)
         return False
 
 
 # ============================================================
-# DATE / TIME PARSER
+# TIME PARSER
 # ============================================================
 
 def parse_utc(value):
+    value = str(value).strip()
 
     if value.endswith("Z"):
         value = value[:-1] + "+00:00"
@@ -164,11 +154,10 @@ def parse_utc(value):
 
 
 # ============================================================
-# GET MARKET DATA FROM TWELVE DATA
+# TWELVE DATA
 # ============================================================
 
-def get_candles(outputsize=120):
-
+def get_candles(outputsize=150):
     url = "https://api.twelvedata.com/time_series"
 
     params = {
@@ -177,66 +166,55 @@ def get_candles(outputsize=120):
         "outputsize": outputsize,
         "apikey": API_KEY,
         "timezone": "UTC",
-        "format": "JSON"
+        "format": "JSON",
     }
 
     try:
-
         response = session.get(
             url,
             params=params,
-            timeout=20
+            timeout=20,
         )
 
         response.raise_for_status()
 
         data = response.json()
 
-        # خطای Twelve Data
         if data.get("status") == "error":
-
-            log.error(
-                "Twelve Data error: %s",
-                data
-            )
-
+            log.error("Twelve Data error: %s", data)
             return []
 
-        result = []
+        if "values" not in data:
+            log.error("Twelve Data returned no values: %s", data)
+            return []
 
-        for item in data.get("values", []):
+        candles = []
 
+        for item in data["values"]:
             try:
+                candles.append(
+                    {
+                        "datetime": parse_utc(item["datetime"]),
+                        "open": float(item["open"]),
+                        "high": float(item["high"]),
+                        "low": float(item["low"]),
+                        "close": float(item["close"]),
+                    }
+                )
 
-                result.append({
-                    "datetime": parse_utc(item["datetime"]),
-                    "open": float(item["open"]),
-                    "high": float(item["high"]),
-                    "low": float(item["low"]),
-                    "close": float(item["close"])
-                })
-
-            except (
-                KeyError,
-                ValueError,
-                TypeError
-            ):
-
+            except (KeyError, TypeError, ValueError):
                 continue
 
-        result.sort(
-            key=lambda x: x["datetime"]
-        )
+        candles.sort(key=lambda item: item["datetime"])
 
-        return result
+        return candles
 
-    except Exception as e:
+    except requests.RequestException as exc:
+        log.error("Market data request error: %s", exc)
+        return []
 
-        log.error(
-            "Market data error: %s",
-            e
-        )
-
+    except Exception as exc:
+        log.error("Market data error: %s", exc)
         return []
 
 
@@ -245,102 +223,58 @@ def get_candles(outputsize=120):
 # ============================================================
 
 def get_closed_candles(candles):
-
     now = datetime.now(timezone.utc)
 
     closed = []
 
     for candle in candles:
 
-        # تایم‌فریم 5 دقیقه است.
-        # datetime کندل = زمان شروع کندل
-        close_time = (
-            candle["datetime"].timestamp() + 300
-        )
+        # XAU/USD 5-minute candle
+        # datetime = opening time of candle
+        close_time = candle["datetime"].timestamp() + 300
 
         if now.timestamp() >= close_time:
-
             closed.append(candle)
 
     return closed
 
 
-# ============================================================
-# CANDLE AGE
-# ============================================================
-
 def candle_age_minutes(candle):
-
     now = datetime.now(timezone.utc)
 
-    close_time = (
-        candle["datetime"].timestamp() + 300
+    close_time = candle["datetime"].timestamp() + 300
+
+    return max(
+        0.0,
+        (now.timestamp() - close_time) / 60.0,
     )
-
-    age = (
-        now.timestamp() - close_time
-    ) / 60.0
-
-    return max(0.0, age)
 
 
 # ============================================================
 # EMA
 # ============================================================
 
-def ema(values, period):
-
-    if len(values) < period:
-        return None
-
-    multiplier = 2 / (period + 1)
-
-    value = sum(
-        values[:period]
-    ) / period
-
-    for price in values[period:]:
-
-        value = (
-            (price - value)
-            * multiplier
-            + value
-        )
-
-    return value
-
-
-# ============================================================
-# EMA SERIES
-# ============================================================
-
 def ema_series(values, period):
-
     if len(values) < period:
         return []
 
     multiplier = 2 / (period + 1)
 
-    value = sum(
-        values[:period]
-    ) / period
+    current = sum(values[:period]) / period
 
-    output = (
-        [None] * (period - 1)
-        + [value]
-    )
+    result = [None] * (period - 1)
+
+    result.append(current)
 
     for price in values[period:]:
 
-        value = (
-            (price - value)
-            * multiplier
-            + value
-        )
+        current = (
+            (price - current) * multiplier
+        ) + current
 
-        output.append(value)
+        result.append(current)
 
-    return output
+    return result
 
 
 # ============================================================
@@ -355,58 +289,35 @@ def rsi(values, period=14):
     gains = []
     losses = []
 
-    for i in range(1, len(values)):
+    for index in range(1, len(values)):
 
-        difference = (
-            values[i] - values[i - 1]
-        )
+        change = values[index] - values[index - 1]
 
-        gains.append(
-            max(difference, 0)
-        )
+        gains.append(max(change, 0.0))
+        losses.append(max(-change, 0.0))
 
-        losses.append(
-            max(-difference, 0)
-        )
+    average_gain = sum(gains[:period]) / period
+    average_loss = sum(losses[:period]) / period
 
-    average_gain = (
-        sum(gains[:period])
-        / period
-    )
-
-    average_loss = (
-        sum(losses[:period])
-        / period
-    )
-
-    for i in range(period, len(gains)):
+    for index in range(period, len(gains)):
 
         average_gain = (
-            (
-                average_gain
-                * (period - 1)
-            )
-            + gains[i]
+            (average_gain * (period - 1))
+            + gains[index]
         ) / period
 
         average_loss = (
-            (
-                average_loss
-                * (period - 1)
-            )
-            + losses[i]
+            (average_loss * (period - 1))
+            + losses[index]
         ) / period
 
     if average_loss == 0:
         return 100.0
 
-    rs = (
-        average_gain
-        / average_loss
-    )
+    relative_strength = average_gain / average_loss
 
-    return 100 - (
-        100 / (1 + rs)
+    return 100.0 - (
+        100.0 / (1.0 + relative_strength)
     )
 
 
@@ -421,276 +332,373 @@ def atr(candles, period=14):
 
     true_ranges = []
 
-    for i in range(1, len(candles)):
+    for index in range(1, len(candles)):
 
-        high = candles[i]["high"]
-        low = candles[i]["low"]
-
-        previous_close = (
-            candles[i - 1]["close"]
-        )
+        high = candles[index]["high"]
+        low = candles[index]["low"]
+        previous_close = candles[index - 1]["close"]
 
         true_range = max(
             high - low,
             abs(high - previous_close),
-            abs(low - previous_close)
+            abs(low - previous_close),
         )
 
-        true_ranges.append(
-            true_range
-        )
+        true_ranges.append(true_range)
 
-    value = (
-        sum(true_ranges[:period])
-        / period
-    )
+    value = sum(
+        true_ranges[:period]
+    ) / period
 
-    for tr in true_ranges[period:]:
+    for true_range in true_ranges[period:]:
 
         value = (
-            (
-                value * (period - 1)
-            )
-            + tr
+            (value * (period - 1))
+            + true_range
         ) / period
 
     return value
 
 
 # ============================================================
-# CANDLE DIRECTION
+# CANDLE QUALITY
 # ============================================================
 
-def candle_direction(candle):
+def candle_body_ratio(candle):
 
-    if candle["close"] > candle["open"]:
-        return "BULLISH"
+    candle_range = candle["high"] - candle["low"]
 
-    if candle["close"] < candle["open"]:
-        return "BEARISH"
+    if candle_range <= 0:
+        return 0.0
 
-    return "NEUTRAL"
+    body = abs(
+        candle["close"] - candle["open"]
+    )
+
+    return body / candle_range
 
 
 # ============================================================
-# MARKET ANALYSIS
+# MARKET STRUCTURE
+# ============================================================
+
+def calculate_market_structure(candles):
+
+    if len(candles) < 12:
+        return "NEUTRAL", 0
+
+    recent = candles[-6:]
+    previous = candles[-12:-6]
+
+    recent_high = max(
+        c["high"] for c in recent
+    )
+
+    recent_low = min(
+        c["low"] for c in recent
+    )
+
+    previous_high = max(
+        c["high"] for c in previous
+    )
+
+    previous_low = min(
+        c["low"] for c in previous
+    )
+
+    bullish = (
+        recent_high > previous_high
+        and recent_low > previous_low
+    )
+
+    bearish = (
+        recent_high < previous_high
+        and recent_low < previous_low
+    )
+
+    if bullish:
+        return "BULLISH", 15
+
+    if bearish:
+        return "BEARISH", 15
+
+    return "NEUTRAL", 0
+
+
+# ============================================================
+# MAIN ANALYSIS
 # ============================================================
 
 def calculate_analysis(candles):
 
+    if len(candles) < 60:
+        return None
+
     closes = [
-        candle["close"]
-        for candle in candles
+        c["close"]
+        for c in candles
     ]
 
-    ema9_series = ema_series(
+    fast_series = ema_series(
         closes,
-        9
+        EMA_FAST,
     )
 
-    ema21_series = ema_series(
+    slow_series = ema_series(
         closes,
-        21
+        EMA_SLOW,
     )
 
     if (
-        len(ema9_series) < 2
-        or len(ema21_series) < 2
+        len(fast_series) < 4
+        or len(slow_series) < 4
     ):
         return None
 
-    ema9 = ema9_series[-1]
-    ema21 = ema21_series[-1]
+    ema_fast = fast_series[-1]
+    ema_slow = slow_series[-1]
 
-    previous_ema9 = ema9_series[-2]
-    previous_ema21 = ema21_series[-2]
+    previous_fast = fast_series[-2]
+    previous_slow = slow_series[-2]
+
+    older_fast = fast_series[-4]
+    older_slow = slow_series[-4]
 
     price = closes[-1]
 
-    rsi_value = rsi(closes)
+    current_rsi = rsi(
+        closes,
+        RSI_PERIOD,
+    )
 
-    atr_value = atr(candles)
+    current_atr = atr(
+        candles,
+        ATR_PERIOD,
+    )
 
     if (
-        rsi_value is None
-        or atr_value is None
+        current_rsi is None
+        or current_atr is None
     ):
         return None
 
-    bullish_score = 0
-    bearish_score = 0
+    if not (
+        MIN_ATR
+        <= current_atr
+        <= MAX_ATR
+    ):
 
+        return {
+            "price": price,
+            "ema9": ema_fast,
+            "ema21": ema_slow,
+            "rsi": current_rsi,
+            "atr": current_atr,
+            "bull": 0,
+            "bear": 0,
+            "trend": "خنثی",
+            "score": 0,
+            "structure": "NEUTRAL",
+            "atr_valid": False,
+        }
 
-    # --------------------------------------------------------
-    # EMA 9 vs EMA 21
-    # --------------------------------------------------------
-
-    if ema9 > ema21:
-
-        bullish_score += 25
-
-    elif ema9 < ema21:
-
-        bearish_score += 25
-
-
-    # --------------------------------------------------------
-    # PRICE vs EMA 9
-    # --------------------------------------------------------
-
-    if price > ema9:
-
-        bullish_score += 15
-
-    elif price < ema9:
-
-        bearish_score += 15
-
+    bull = 0
+    bear = 0
 
     # --------------------------------------------------------
-    # EMA 9 MOMENTUM
+    # 1. EMA ALIGNMENT = 25
     # --------------------------------------------------------
 
-    if ema9 > previous_ema9:
+    if ema_fast > ema_slow:
+        bull += 25
 
-        bullish_score += 10
-
-    elif ema9 < previous_ema9:
-
-        bearish_score += 10
-
+    elif ema_fast < ema_slow:
+        bear += 25
 
     # --------------------------------------------------------
-    # EMA 21 MOMENTUM
+    # 2. PRICE VS EMA9 = 15
     # --------------------------------------------------------
 
-    if ema21 > previous_ema21:
+    if price > ema_fast:
+        bull += 15
 
-        bullish_score += 10
-
-    elif ema21 < previous_ema21:
-
-        bearish_score += 10
-
+    elif price < ema_fast:
+        bear += 15
 
     # --------------------------------------------------------
-    # RSI
+    # 3. EMA9 SLOPE = 10
     # --------------------------------------------------------
 
-    if 52 <= rsi_value <= 68:
+    if ema_fast > previous_fast:
+        bull += 10
 
-        bullish_score += 20
-
-    elif 32 <= rsi_value <= 48:
-
-        bearish_score += 20
-
+    elif ema_fast < previous_fast:
+        bear += 10
 
     # --------------------------------------------------------
-    # EXTREME RSI PROTECTION
+    # 4. EMA21 SLOPE = 10
     # --------------------------------------------------------
 
-    if rsi_value > 72:
+    if ema_slow > previous_slow:
+        bull += 10
 
-        bullish_score -= 10
-
-    if rsi_value < 28:
-
-        bearish_score -= 10
-
+    elif ema_slow < previous_slow:
+        bear += 10
 
     # --------------------------------------------------------
-    # LATEST CLOSED CANDLE
+    # 5. RSI = 15
+    # --------------------------------------------------------
+
+    if 52 <= current_rsi <= 68:
+        bull += 15
+
+    elif 32 <= current_rsi <= 48:
+        bear += 15
+
+    elif 68 < current_rsi <= 72:
+        if ema_fast > ema_slow:
+            bull += 8
+
+    elif 28 <= current_rsi < 32:
+        if ema_fast < ema_slow:
+            bear += 8
+
+    # جلوگیری از ورود خیلی دیرهنگام
+    if current_rsi > 75:
+        bull = max(
+            0,
+            bull - 15,
+        )
+
+    if current_rsi < 25:
+        bear = max(
+            0,
+            bear - 15,
+        )
+
+    # --------------------------------------------------------
+    # 6. MARKET STRUCTURE = 15
+    # --------------------------------------------------------
+
+    structure, structure_score = (
+        calculate_market_structure(candles)
+    )
+
+    if structure == "BULLISH":
+        bull += structure_score
+
+    elif structure == "BEARISH":
+        bear += structure_score
+
+    # --------------------------------------------------------
+    # 7. CANDLE QUALITY = 10
     # --------------------------------------------------------
 
     latest = candles[-1]
 
-    if latest["close"] > latest["open"]:
-
-        bullish_score += 10
-
-    elif latest["close"] < latest["open"]:
-
-        bearish_score += 10
-
-
-    # --------------------------------------------------------
-    # PREVIOUS CLOSED CANDLE
-    # --------------------------------------------------------
-
-    previous = candles[-2]
-
-    if previous["close"] > previous["open"]:
-
-        bullish_score += 10
-
-    elif previous["close"] < previous["open"]:
-
-        bearish_score += 10
-
-
-    # --------------------------------------------------------
-    # LIMIT SCORE
-    # --------------------------------------------------------
-
-    bullish_score = max(
-        0,
-        min(100, bullish_score)
+    body_ratio = candle_body_ratio(
+        latest
     )
 
-    bearish_score = max(
-        0,
-        min(100, bearish_score)
+    if body_ratio >= 0.55:
+
+        if latest["close"] > latest["open"]:
+            bull += 10
+
+        elif latest["close"] < latest["open"]:
+            bear += 10
+
+    # مهم:
+    # یک کندل اصلاحی کوچک، روند قوی را به تنهایی حذف نمی‌کند.
+
+    # --------------------------------------------------------
+    # 8. EMA MOMENTUM = 5
+    # --------------------------------------------------------
+
+    fast_rising = (
+        ema_fast > older_fast
     )
 
+    fast_falling = (
+        ema_fast < older_fast
+    )
+
+    slow_rising = (
+        ema_slow > older_slow
+    )
+
+    slow_falling = (
+        ema_slow < older_slow
+    )
+
+    if fast_rising and slow_rising:
+        bull += 5
+
+    if fast_falling and slow_falling:
+        bear += 5
+
+    bull = min(
+        100,
+        bull,
+    )
+
+    bear = min(
+        100,
+        bear,
+    )
 
     # --------------------------------------------------------
     # TREND
     # --------------------------------------------------------
 
-    if bullish_score >= bearish_score:
+    if bull > bear:
 
-        score = bullish_score
+        score = bull
 
-        if score >= 80:
+        if score >= 85:
+            trend = "صعودی بسیار قوی"
 
-            trend = "Strong Bullish"
+        elif score >= 70:
+            trend = "صعودی قوی"
 
         elif score >= 60:
-
-            trend = "Bullish"
+            trend = "صعودی"
 
         else:
+            trend = "خنثی"
 
-            trend = "Neutral"
+    elif bear > bull:
+
+        score = bear
+
+        if score >= 85:
+            trend = "نزولی بسیار قوی"
+
+        elif score >= 70:
+            trend = "نزولی قوی"
+
+        elif score >= 60:
+            trend = "نزولی"
+
+        else:
+            trend = "خنثی"
 
     else:
-
-        score = bearish_score
-
-        if score >= 80:
-
-            trend = "Strong Bearish"
-
-        elif score >= 60:
-
-            trend = "Bearish"
-
-        else:
-
-            trend = "Neutral"
-
+        score = 0
+        trend = "خنثی"
 
     return {
         "price": price,
-        "ema9": ema9,
-        "ema21": ema21,
-        "rsi": rsi_value,
-        "atr": atr_value,
-        "bull": bullish_score,
-        "bear": bearish_score,
+        "ema9": ema_fast,
+        "ema21": ema_slow,
+        "rsi": current_rsi,
+        "atr": current_atr,
+        "bull": bull,
+        "bear": bear,
         "trend": trend,
-        "score": int(score)
+        "score": int(score),
+        "structure": structure,
+        "atr_valid": True,
     }
 
 
@@ -698,54 +706,71 @@ def calculate_analysis(candles):
 # SIGNAL CONFIRMATION
 # ============================================================
 
-def confirm_signal(candles, analysis):
+def confirm_signal(
+    candles,
+    analysis,
+):
 
-    latest = candles[-1]
+    if not analysis["atr_valid"]:
+        return "HOLD", 0
 
-    bullish_candle = (
-        latest["close"]
-        > latest["open"]
-    )
+    bull = analysis["bull"]
+    bear = analysis["bear"]
+    score = analysis["score"]
 
-    bearish_candle = (
-        latest["close"]
-        < latest["open"]
-    )
+    if score < MIN_SIGNAL_SCORE:
+        return "HOLD", 0
 
+    if abs(bull - bear) < MIN_SCORE_MARGIN:
+        return "HOLD", 0
 
+    price = analysis["price"]
+    ema9 = analysis["ema9"]
+    ema21 = analysis["ema21"]
+    current_rsi = analysis["rsi"]
+    structure = analysis["structure"]
+
+    # --------------------------------------------------------
     # BUY
+    # --------------------------------------------------------
+
     if (
-        analysis["bull"]
-        > analysis["bear"]
-        and bullish_candle
+        bull > bear
+        and bull >= MIN_SIGNAL_SCORE
+        and ema9 > ema21
+        and price > ema9
+        and structure == "BULLISH"
+        and 50 <= current_rsi <= 72
     ):
+        return "BUY", 3
 
-        return "BUY", 1
-
-
+    # --------------------------------------------------------
     # SELL
+    # --------------------------------------------------------
+
     if (
-        analysis["bear"]
-        > analysis["bull"]
-        and bearish_candle
+        bear > bull
+        and bear >= MIN_SIGNAL_SCORE
+        and ema9 < ema21
+        and price < ema9
+        and structure == "BEARISH"
+        and 28 <= current_rsi <= 50
     ):
-
-        return "SELL", 1
-
+        return "SELL", 3
 
     return "HOLD", 0
 
 
 # ============================================================
-# TP / SL LEVELS
+# TP / SL
 # ============================================================
 
-def levels(
+def calculate_levels(
     signal,
     price,
-    atr_value,
+    current_atr,
     support,
-    resistance
+    resistance,
 ):
 
     if signal == "BUY":
@@ -753,171 +778,150 @@ def levels(
         return {
             "entry": price,
 
-            "tp1": (
-                price
-                + atr_value * TP1_ATR
-            ),
+            "tp1": price
+            + current_atr * TP1_ATR,
 
-            "tp2": (
-                price
-                + atr_value * TP2_ATR
-            ),
+            "tp2": price
+            + current_atr * TP2_ATR,
 
-            "tp3": (
-                price
-                + atr_value * TP3_ATR
-            ),
+            "tp3": price
+            + current_atr * TP3_ATR,
 
-            "sl": (
-                price
-                - atr_value * SL_ATR
-            ),
+            "sl": price
+            - current_atr * SL_ATR,
 
             "support": support,
-            "resistance": resistance
+            "resistance": resistance,
         }
-
 
     if signal == "SELL":
 
         return {
             "entry": price,
 
-            "tp1": (
-                price
-                - atr_value * TP1_ATR
-            ),
+            "tp1": price
+            - current_atr * TP1_ATR,
 
-            "tp2": (
-                price
-                - atr_value * TP2_ATR
-            ),
+            "tp2": price
+            - current_atr * TP2_ATR,
 
-            "tp3": (
-                price
-                - atr_value * TP3_ATR
-            ),
+            "tp3": price
+            - current_atr * TP3_ATR,
 
-            "sl": (
-                price
-                + atr_value * SL_ATR
-            ),
+            "sl": price
+            + current_atr * SL_ATR,
 
             "support": support,
-            "resistance": resistance
+            "resistance": resistance,
         }
-
 
     return None
 
 
 # ============================================================
-# PERSIAN TEXT CONVERSION
+# REPEATED SIGNAL FILTER
 # ============================================================
 
-def persian_trend(trend):
+def repeated_signal_is_allowed(
+    signal,
+    price,
+    current_atr,
+    score,
+):
 
-    mapping = {
+    if last_sent_signal is None:
+        return True
 
-        "Strong Bullish":
-            "صعودی قوی",
+    # تغییر جهت همیشه اجازه دارد
+    if signal != last_sent_signal:
+        return True
 
-        "Bullish":
-            "صعودی",
+    if (
+        last_sent_price is None
+        or last_sent_score is None
+    ):
+        return True
 
-        "Strong Bearish":
-            "نزولی قوی",
-
-        "Bearish":
-            "نزولی",
-
-        "Neutral":
-            "خنثی"
-    }
-
-    return mapping.get(
-        trend,
-        trend
+    price_move = abs(
+        price - last_sent_price
     )
 
+    # اگر قیمت حداقل 0.6 ATR حرکت کرده باشد
+    if price_move >= current_atr * 0.60:
+        return True
+
+    # یا قدرت سیگنال حداقل 8 امتیاز بهتر شده باشد
+    if score >= last_sent_score + 8:
+        return True
+
+    return False
+
 
 # ============================================================
-# PERSIAN SIGNAL MESSAGE
+# TELEGRAM MESSAGE - PERSIAN
 # ============================================================
 
 def build_message(
     signal,
     analysis,
-    levels_data,
-    confirmation_count
+    levels,
+    confirmation_count,
 ):
 
     if signal == "BUY":
-
         title = "🟢 سیگنال طلا — خرید"
 
     else:
-
         title = "🔴 سیگنال طلا — فروش"
 
+    if analysis["score"] >= 85:
+        quality = "بسیار قوی"
 
-    if analysis["score"] >= 75:
-
-        quality = "بالا"
+    elif analysis["score"] >= 75:
+        quality = "قوی"
 
     else:
+        quality = "معتبر"
 
-        quality = "متوسط"
-
-
-    trend = persian_trend(
-        analysis["trend"]
-    )
-
-
-    message = f"""
+    return f"""
 {title}
 
-نماد: {SYMBOL}
-تایم‌فریم: 5 دقیقه
+🔹 نماد: XAU/USD
+⏱ تایم‌فریم: ۵ دقیقه
 
-💰 قیمت: {analysis["price"]:.2f}
+💰 قیمت ورود: {levels["entry"]:.2f}
 
-📊 روند: {trend}
-امتیاز روند: {analysis["score"]}/100
+📊 روند: {analysis["trend"]}
+⭐ امتیاز سیگنال: {analysis["score"]}/100
+🏆 کیفیت: {quality}
 
-EMA 9: {analysis["ema9"]:.2f}
-EMA 21: {analysis["ema21"]:.2f}
-RSI: {analysis["rsi"]:.2f}
-ATR: {analysis["atr"]:.2f}
-
-━━━━━━━━━━━━━━━━
-
-💰 نقطه ورود: {levels_data["entry"]:.2f}
-
-🎯 هدف اول: {levels_data["tp1"]:.2f}
-🎯 هدف دوم: {levels_data["tp2"]:.2f}
-🎯 هدف سوم: {levels_data["tp3"]:.2f}
-
-🛑 حد ضرر: {levels_data["sl"]:.2f}
+📈 EMA 9: {analysis["ema9"]:.2f}
+📉 EMA 21: {analysis["ema21"]:.2f}
+📊 RSI: {analysis["rsi"]:.2f}
+📏 ATR: {analysis["atr"]:.2f}
 
 ━━━━━━━━━━━━━━━━
 
-📉 حمایت: {levels_data["support"]:.2f}
-📈 مقاومت: {levels_data["resistance"]:.2f}
+🎯 هدف اول: {levels["tp1"]:.2f}
+🎯 هدف دوم: {levels["tp2"]:.2f}
+🎯 هدف سوم: {levels["tp3"]:.2f}
 
-✅ تأیید سیگنال: {confirmation_count}/2
-⭐ کیفیت سیگنال: {quality}
+🛑 حد ضرر: {levels["sl"]:.2f}
 
-⚠️ صرفاً تحلیل تکنیکال
-معامله خودکار فعال نیست.
-"""
+━━━━━━━━━━━━━━━━
 
-    return message.strip()
+📉 حمایت: {levels["support"]:.2f}
+📈 مقاومت: {levels["resistance"]:.2f}
+
+✅ تأیید: {confirmation_count}/3
+🔒 فقط بر اساس کندل بسته‌شده
+
+⚠️ تحلیل تکنیکال است و فعلاً معامله خودکار فعال نیست.
+""".strip()
 
 
 # ============================================================
-# MAIN ANALYSIS
+# ANALYZE
 # ============================================================
 
 def analyze():
@@ -925,43 +929,32 @@ def analyze():
     global last_processed_candle
     global last_sent_signal
     global last_sent_candle
-
-
-    # --------------------------------------------------------
-    # GET DATA
-    # --------------------------------------------------------
+    global last_sent_price
+    global last_sent_score
 
     candles = get_candles()
 
-    if len(candles) < 30:
+    if len(candles) < 60:
 
         log.warning(
-            "Not enough candles."
+            "کندل کافی دریافت نشد: %d",
+            len(candles),
         )
 
         return
-
-
-    # --------------------------------------------------------
-    # ONLY CLOSED CANDLES
-    # --------------------------------------------------------
 
     closed = get_closed_candles(
         candles
     )
 
-    if len(closed) < 30:
+    if len(closed) < 60:
 
         log.warning(
-            "Not enough CLOSED candles."
+            "کندل بسته‌شده کافی نیست: %d",
+            len(closed),
         )
 
         return
-
-
-    # --------------------------------------------------------
-    # LATEST CLOSED CANDLE
-    # --------------------------------------------------------
 
     latest = closed[-1]
 
@@ -969,44 +962,29 @@ def analyze():
         latest["datetime"].isoformat()
     )
 
-
-    # --------------------------------------------------------
-    # DUPLICATE PROTECTION
-    # --------------------------------------------------------
-
+    # یک تحلیل برای هر کندل بسته‌شده
     if candle_id == last_processed_candle:
-
         return
-
 
     age = candle_age_minutes(
         latest
     )
 
     log.info(
-        "New CLOSED candle detected | age=%.2f min",
-        age
+        "New closed 5m candle | age=%.2f min | candle=%s",
+        age,
+        candle_id,
     )
-
-
-    # --------------------------------------------------------
-    # STALE CANDLE PROTECTION
-    # --------------------------------------------------------
 
     if age > MAX_CANDLE_AGE_MINUTES:
 
         log.warning(
-            "Candle rejected as stale."
+            "کندل قدیمی رد شد."
         )
 
         last_processed_candle = candle_id
 
         return
-
-
-    # --------------------------------------------------------
-    # CALCULATE INDICATORS
-    # --------------------------------------------------------
 
     analysis = calculate_analysis(
         closed
@@ -1015,44 +993,31 @@ def analyze():
     if not analysis:
 
         log.warning(
-            "Indicator calculation failed."
+            "محاسبه اندیکاتورها ناموفق بود."
         )
+
+        last_processed_candle = candle_id
 
         return
 
-
-    # --------------------------------------------------------
-    # SUPPORT / RESISTANCE
-    # --------------------------------------------------------
-
-    recent = closed[-20:]
+    recent = closed[-30:]
 
     support = min(
-        candle["low"]
-        for candle in recent
+        c["low"]
+        for c in recent
     )
 
     resistance = max(
-        candle["high"]
-        for candle in recent
+        c["high"]
+        for c in recent
     )
-
-
-    # --------------------------------------------------------
-    # SIGNAL
-    # --------------------------------------------------------
 
     signal, confirmation_count = (
         confirm_signal(
             closed,
-            analysis
+            analysis,
         )
     )
-
-
-    # --------------------------------------------------------
-    # LOG
-    # --------------------------------------------------------
 
     log.info(
         "Price=%.2f | EMA9=%.2f | EMA21=%.2f | RSI=%.2f | ATR=%.2f",
@@ -1060,142 +1025,73 @@ def analyze():
         analysis["ema9"],
         analysis["ema21"],
         analysis["rsi"],
-        analysis["atr"]
+        analysis["atr"],
     )
 
     log.info(
-        "Signal=%s | Trend=%s | Score=%d | Confirmation=%d",
-        signal,
-        analysis["trend"],
+        "Bull=%d | Bear=%d | Score=%d | Trend=%s | Structure=%s | Signal=%s",
+        analysis["bull"],
+        analysis["bear"],
         analysis["score"],
-        confirmation_count
+        analysis["trend"],
+        analysis["structure"],
+        signal,
     )
 
-
-    # --------------------------------------------------------
-    # HOLD
-    # --------------------------------------------------------
+    # این کندل بررسی شد
+    last_processed_candle = candle_id
 
     if signal == "HOLD":
 
         log.info(
-            "No actionable signal."
-        )
-
-        last_processed_candle = (
-            candle_id
+            "شرایط سیگنال قوی وجود ندارد؛ پیام ارسال نشد."
         )
 
         return
 
-
-    # --------------------------------------------------------
-    # MINIMUM SCORE
-    # --------------------------------------------------------
-
-    if analysis["score"] < MIN_TREND_SCORE:
+    if not repeated_signal_is_allowed(
+        signal,
+        analysis["price"],
+        analysis["atr"],
+        analysis["score"],
+    ):
 
         log.info(
-            "Signal rejected: score=%d < minimum=%d",
-            analysis["score"],
-            MIN_TREND_SCORE
-        )
-
-        last_processed_candle = (
-            candle_id
+            "سیگنال تکراری و نزدیک به سیگنال قبلی حذف شد."
         )
 
         return
 
-
-    # --------------------------------------------------------
-    # DIRECTION CHECK
-    # --------------------------------------------------------
-
-    if (
-        signal == "BUY"
-        and analysis["bull"]
-        <= analysis["bear"]
-    ):
-
-        last_processed_candle = (
-            candle_id
-        )
-
-        return
-
-
-    if (
-        signal == "SELL"
-        and analysis["bear"]
-        <= analysis["bull"]
-    ):
-
-        last_processed_candle = (
-            candle_id
-        )
-
-        return
-
-
-    # --------------------------------------------------------
-    # CALCULATE LEVELS
-    # --------------------------------------------------------
-
-    levels_data = levels(
+    levels = calculate_levels(
         signal,
         analysis["price"],
         analysis["atr"],
         support,
-        resistance
+        resistance,
     )
 
-
-    if not levels_data:
-
-        last_processed_candle = (
-            candle_id
-        )
-
+    if not levels:
         return
-
-
-    # --------------------------------------------------------
-    # BUILD PERSIAN MESSAGE
-    # --------------------------------------------------------
 
     message = build_message(
         signal,
         analysis,
-        levels_data,
-        confirmation_count
+        levels,
+        confirmation_count,
     )
-
-
-    # --------------------------------------------------------
-    # SEND TELEGRAM
-    # --------------------------------------------------------
 
     if send_telegram(message):
 
         last_sent_signal = signal
-
         last_sent_candle = candle_id
-
-        last_processed_candle = (
-            candle_id
-        )
+        last_sent_price = analysis["price"]
+        last_sent_score = analysis["score"]
 
         log.info(
-            "Signal delivered | direction=%s",
-            signal
-        )
-
-    else:
-
-        log.warning(
-            "Telegram failed. "
-            "Candle will be retried."
+            "Signal delivered | %s | price=%.2f | score=%d",
+            signal,
+            analysis["price"],
+            analysis["score"],
         )
 
 
@@ -1210,36 +1106,36 @@ def startup():
     )
 
     log.info(
-        "GOLD SIGNAL BOT - PERSIAN VERSION"
+        "GOLD SIGNAL BOT - STRONG SIGNAL MODE"
     )
 
     log.info(
-        "Professional Analysis Mode: ON"
+        "Professional Analysis: ON"
     )
 
     log.info(
         "Symbol: %s",
-        SYMBOL
+        SYMBOL,
     )
 
     log.info(
         "Timeframe: %s",
-        INTERVAL
+        INTERVAL,
     )
 
     log.info(
-        "Minimum Trend Score: %d/100",
-        MIN_TREND_SCORE
+        "Minimum Signal Score: %d/100",
+        MIN_SIGNAL_SCORE,
     )
 
     log.info(
-        "Scan interval: %d seconds",
-        CHECK_SECONDS
+        "Minimum Score Margin: %d",
+        MIN_SCORE_MARGIN,
     )
 
     log.info(
-        "Maximum Candle Age: %d minutes",
-        MAX_CANDLE_AGE_MINUTES
+        "Scan Interval: %d seconds",
+        CHECK_SECONDS,
     )
 
     log.info(
@@ -1247,15 +1143,11 @@ def startup():
     )
 
     log.info(
-        "Duplicate Candle Protection: ON"
+        "Strong Structure Confirmation: ON"
     )
 
     log.info(
-        "Same-direction signal updates: ON"
-    )
-
-    log.info(
-        "Telegram retry on failure: ON"
+        "Repeated Signal Filter: ON"
     )
 
     log.info(
@@ -1268,10 +1160,6 @@ def startup():
 
     log.info(
         "Telegram timestamps: OFF"
-    )
-
-    log.info(
-        "Persian Telegram Messages: ON"
     )
 
     log.info(
@@ -1301,11 +1189,11 @@ def main():
 
             break
 
-        except Exception as e:
+        except Exception as exc:
 
             log.exception(
                 "Unexpected error: %s",
-                e
+                exc,
             )
 
         time.sleep(
@@ -1313,10 +1201,5 @@ def main():
         )
 
 
-# ============================================================
-# RUN
-# ============================================================
-
 if __name__ == "__main__":
-
     main()
