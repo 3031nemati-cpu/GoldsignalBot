@@ -24,9 +24,12 @@ API_KEY = os.getenv("API_KEY")
 SYMBOL = "XAU/USD"
 INTERVAL = "5min"
 
-# هر 60 ثانیه داده بررسی می‌شود، اما فقط با تشکیل
-# کندل 5 دقیقه‌ای جدید یک تحلیل جدید انجام می‌شود.
-CHECK_SECONDS = 60
+# فقط یک بار برای هر کندل 5 دقیقه‌ای از Twelve Data داده می‌گیریم.
+# این کار مصرف API را از حدود 1440 درخواست روزانه به حدود 288 می‌رساند.
+CANDLE_SECONDS = 300
+FETCH_DELAY_AFTER_CLOSE_SECONDS = 75
+REQUEST_TIMEOUT_SECONDS = 20
+MAX_CONSECUTIVE_API_FAILURES = 3
 
 # فیلتر اصلی کیفیت
 MIN_SIGNAL_SCORE = 70
@@ -101,6 +104,10 @@ last_sent_candle = None
 last_sent_price = None
 last_sent_score = None
 
+# زمان درخواست بعدی داده از Twelve Data
+next_fetch_time = 0.0
+consecutive_api_failures = 0
+
 
 # ============================================================
 # TELEGRAM
@@ -116,8 +123,15 @@ def send_telegram(message):
                 "chat_id": CHAT_ID,
                 "text": message,
             },
-            timeout=20,
+            timeout=REQUEST_TIMEOUT_SECONDS,
         )
+
+        if response.status_code == 429:
+            log.error(
+                "Twelve Data HTTP 429: API limit reached. "
+                "No rapid retry will be performed."
+            )
+            return []
 
         response.raise_for_status()
 
@@ -181,7 +195,10 @@ def get_candles(outputsize=150):
         data = response.json()
 
         if data.get("status") == "error":
-            log.error("Twelve Data error: %s", data)
+            safe_data = dict(data) if isinstance(data, dict) else data
+            if isinstance(safe_data, dict):
+                safe_data.pop("apikey", None)
+            log.error("Twelve Data error: %s", safe_data)
             return []
 
         if "values" not in data:
@@ -924,7 +941,10 @@ def build_message(
 # ANALYZE
 # ============================================================
 
-def analyze():
+def analyze(candles):
+    """
+    تحلیل فقط روی داده‌ای که در زمان‌بندی کنترل‌شده از Twelve Data گرفته شده.
+    """
 
     global last_processed_candle
     global last_sent_signal
@@ -932,43 +952,32 @@ def analyze():
     global last_sent_price
     global last_sent_score
 
-    candles = get_candles()
-
     if len(candles) < 60:
-
         log.warning(
             "کندل کافی دریافت نشد: %d",
             len(candles),
         )
-
         return
 
-    closed = get_closed_candles(
-        candles
-    )
+    closed = get_closed_candles(candles)
 
     if len(closed) < 60:
-
         log.warning(
             "کندل بسته‌شده کافی نیست: %d",
             len(closed),
         )
-
         return
 
     latest = closed[-1]
 
-    candle_id = (
-        latest["datetime"].isoformat()
-    )
+    candle_id = latest["datetime"].isoformat()
 
     # یک تحلیل برای هر کندل بسته‌شده
     if candle_id == last_processed_candle:
+        log.info("این کندل قبلاً تحلیل شده است.")
         return
 
-    age = candle_age_minutes(
-        latest
-    )
+    age = candle_age_minutes(latest)
 
     log.info(
         "New closed 5m candle | age=%.2f min | candle=%s",
@@ -977,46 +986,25 @@ def analyze():
     )
 
     if age > MAX_CANDLE_AGE_MINUTES:
-
-        log.warning(
-            "کندل قدیمی رد شد."
-        )
-
+        log.warning("کندل قدیمی رد شد.")
         last_processed_candle = candle_id
-
         return
 
-    analysis = calculate_analysis(
-        closed
-    )
+    analysis = calculate_analysis(closed)
 
     if not analysis:
-
-        log.warning(
-            "محاسبه اندیکاتورها ناموفق بود."
-        )
-
+        log.warning("محاسبه اندیکاتورها ناموفق بود.")
         last_processed_candle = candle_id
-
         return
 
     recent = closed[-30:]
 
-    support = min(
-        c["low"]
-        for c in recent
-    )
+    support = min(c["low"] for c in recent)
+    resistance = max(c["high"] for c in recent)
 
-    resistance = max(
-        c["high"]
-        for c in recent
-    )
-
-    signal, confirmation_count = (
-        confirm_signal(
-            closed,
-            analysis,
-        )
+    signal, confirmation_count = confirm_signal(
+        closed,
+        analysis,
     )
 
     log.info(
@@ -1038,15 +1026,11 @@ def analyze():
         signal,
     )
 
-    # این کندل بررسی شد
+    # این کندل بررسی شد؛ از تحلیل مجدد آن جلوگیری می‌کنیم.
     last_processed_candle = candle_id
 
     if signal == "HOLD":
-
-        log.info(
-            "شرایط سیگنال قوی وجود ندارد؛ پیام ارسال نشد."
-        )
-
+        log.info("شرایط سیگنال قوی وجود ندارد؛ پیام ارسال نشد.")
         return
 
     if not repeated_signal_is_allowed(
@@ -1055,11 +1039,7 @@ def analyze():
         analysis["atr"],
         analysis["score"],
     ):
-
-        log.info(
-            "سیگنال تکراری و نزدیک به سیگنال قبلی حذف شد."
-        )
-
+        log.info("سیگنال تکراری و نزدیک به سیگنال قبلی حذف شد.")
         return
 
     levels = calculate_levels(
@@ -1081,7 +1061,6 @@ def analyze():
     )
 
     if send_telegram(message):
-
         last_sent_signal = signal
         last_sent_candle = candle_id
         last_sent_price = analysis["price"]
@@ -1093,6 +1072,62 @@ def analyze():
             analysis["price"],
             analysis["score"],
         )
+
+
+def seconds_until_next_fetch():
+    """
+    فقط یک درخواست برای هر کندل 5 دقیقه‌ای.
+    درخواست 75 ثانیه بعد از بسته‌شدن کندل انجام می‌شود تا
+    تأخیر پردازش داده Twelve Data را در نظر بگیریم.
+    """
+    now = time.time()
+
+    # زمان فعلی را روی بازه‌های 5 دقیقه‌ای می‌بریم.
+    current_bucket = int(now // CANDLE_SECONDS)
+
+    next_close = (current_bucket + 1) * CANDLE_SECONDS
+    target = next_close + FETCH_DELAY_AFTER_CLOSE_SECONDS
+
+    wait = target - now
+
+    if wait <= 0:
+        wait = CANDLE_SECONDS
+
+    return wait
+
+
+def fetch_and_analyze_once():
+    """
+    یک درخواست داده -> یک تحلیل.
+    در صورت 429 یا خطای API، تا نوبت بعدی درخواست صبر می‌کنیم
+    تا مصرف API بیشتر نشود.
+    """
+    global consecutive_api_failures
+
+    candles = get_candles()
+
+    if not candles:
+        consecutive_api_failures += 1
+
+        log.warning(
+            "دریافت داده ناموفق بود | failure=%d/%d",
+            consecutive_api_failures,
+            MAX_CONSECUTIVE_API_FAILURES,
+        )
+
+        if consecutive_api_failures >= MAX_CONSECUTIVE_API_FAILURES:
+            log.warning(
+                "چند درخواست متوالی ناموفق بود. "
+                "ربات تا نوبت بعدی API صبر می‌کند."
+            )
+
+        return False
+
+    consecutive_api_failures = 0
+
+    analyze(candles)
+
+    return True
 
 
 # ============================================================
@@ -1134,8 +1169,12 @@ def startup():
     )
 
     log.info(
-        "Scan Interval: %d seconds",
-        CHECK_SECONDS,
+        "API Schedule: 1 request per 5-minute candle",
+    )
+
+    log.info(
+        "Fetch Delay After Candle Close: %d seconds",
+        FETCH_DELAY_AFTER_CLOSE_SECONDS,
     )
 
     log.info(
@@ -1148,6 +1187,13 @@ def startup():
 
     log.info(
         "Repeated Signal Filter: ON"
+    )
+
+    log.info(
+        "Twelve Data API Protection: ON"
+    )
+    log.info(
+        "One API request per 5-minute candle: ON"
     )
 
     log.info(
@@ -1172,33 +1218,54 @@ def startup():
 # ============================================================
 
 def main():
+    global next_fetch_time
 
     startup()
 
+    # یک بار در شروع اجرا داده می‌گیریم.
+    log.info("Initial market-data request...")
+    fetch_and_analyze_once()
+
+    # درخواست بعدی دقیقاً طبق چرخه 5 دقیقه‌ای برنامه‌ریزی می‌شود.
+    next_fetch_time = time.time() + seconds_until_next_fetch()
+
     while True:
-
         try:
+            now = time.time()
 
-            analyze()
+            if now >= next_fetch_time:
+                log.info("Scheduled 5-minute market-data request...")
+                fetch_and_analyze_once()
+
+                # بعد از هر درخواست، نوبت بعدی دوباره محاسبه می‌شود.
+                next_fetch_time = (
+                    time.time() + seconds_until_next_fetch()
+                )
+
+            else:
+                # خواب کوتاه فقط برای مدیریت زمان‌بندی محلی است؛
+                # هیچ درخواست API در این فاصله ارسال نمی‌شود.
+                sleep_for = min(
+                    5.0,
+                    max(0.5, next_fetch_time - now),
+                )
+                time.sleep(sleep_for)
 
         except KeyboardInterrupt:
-
-            log.info(
-                "Bot stopped."
-            )
-
+            log.info("Bot stopped.")
             break
 
         except Exception as exc:
-
             log.exception(
                 "Unexpected error: %s",
                 exc,
             )
 
-        time.sleep(
-            CHECK_SECONDS
-        )
+            # در صورت خطای غیرمنتظره نیز از درخواست‌های پشت‌سرهم جلوگیری می‌کنیم.
+            next_fetch_time = (
+                time.time()
+                + seconds_until_next_fetch()
+            )
 
 
 if __name__ == "__main__":
