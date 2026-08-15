@@ -43,6 +43,16 @@ EMA_SLOW = 21
 RSI_PERIOD = 14
 ATR_PERIOD = 14
 
+# ADX / Directional Movement
+ADX_PERIOD = 14
+MIN_ADX_FOR_SIGNAL = 25.0
+STRONG_ADX = 30.0
+
+# فیلتر سایه کندل تأییدیه
+# اگر سایه مخالف جهت معامله بیش از 150% بدنه باشد، سیگنال رد می‌شود.
+# مثال SELL: سایه پایین > 1.5 × بدنه => ورود خریداران در کف => رد SELL
+WICK_TO_BODY_MAX = 1.50
+
 # اهداف و حد ضرر بر اساس ATR
 TP1_ATR = 1.0
 TP2_ATR = 2.0
@@ -128,10 +138,9 @@ def send_telegram(message):
 
         if response.status_code == 429:
             log.error(
-                "Twelve Data HTTP 429: API limit reached. "
-                "No rapid retry will be performed."
+                "Telegram HTTP 429: rate limit reached."
             )
-            return []
+            return False
 
         response.raise_for_status()
 
@@ -187,8 +196,12 @@ def get_candles(outputsize=150):
         response = session.get(
             url,
             params=params,
-            timeout=20,
+            timeout=REQUEST_TIMEOUT_SECONDS,
         )
+
+        if response.status_code == 429:
+            log.error("Twelve Data HTTP 429: API limit reached. No rapid retry.")
+            return []
 
         response.raise_for_status()
 
@@ -378,6 +391,132 @@ def atr(candles, period=14):
 
 
 # ============================================================
+# ADX / DIRECTIONAL MOVEMENT
+# ============================================================
+
+def calculate_adx(candles, period=14):
+    """
+    ADX به روش Wilder:
+    - ADX قدرت روند را اندازه می‌گیرد، نه جهت آن.
+    - +DI و -DI جهت غالب روند را مشخص می‌کنند.
+    """
+    if len(candles) < (period * 2) + 1:
+        return None
+
+    tr_values = []
+    plus_dm_values = []
+    minus_dm_values = []
+
+    for i in range(1, len(candles)):
+        high = candles[i]["high"]
+        low = candles[i]["low"]
+        prev_high = candles[i - 1]["high"]
+        prev_low = candles[i - 1]["low"]
+        prev_close = candles[i - 1]["close"]
+
+        up_move = high - prev_high
+        down_move = prev_low - low
+
+        plus_dm = up_move if up_move > down_move and up_move > 0 else 0.0
+        minus_dm = down_move if down_move > up_move and down_move > 0 else 0.0
+
+        true_range = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close),
+        )
+
+        tr_values.append(true_range)
+        plus_dm_values.append(plus_dm)
+        minus_dm_values.append(minus_dm)
+
+    if len(tr_values) < period:
+        return None
+
+    atr_w = sum(tr_values[:period])
+    plus_dm_w = sum(plus_dm_values[:period])
+    minus_dm_w = sum(minus_dm_values[:period])
+
+    dx_values = []
+
+    for i in range(period, len(tr_values)):
+        atr_w = atr_w - (atr_w / period) + tr_values[i]
+        plus_dm_w = plus_dm_w - (plus_dm_w / period) + plus_dm_values[i]
+        minus_dm_w = minus_dm_w - (minus_dm_w / period) + minus_dm_values[i]
+
+        if atr_w <= 0:
+            continue
+
+        plus_di = 100.0 * plus_dm_w / atr_w
+        minus_di = 100.0 * minus_dm_w / atr_w
+
+        di_sum = plus_di + minus_di
+
+        if di_sum <= 0:
+            dx = 0.0
+        else:
+            dx = 100.0 * abs(plus_di - minus_di) / di_sum
+
+        dx_values.append((dx, plus_di, minus_di))
+
+    if len(dx_values) < period:
+        return None
+
+    adx = sum(x[0] for x in dx_values[:period]) / period
+
+    last_plus_di = dx_values[period - 1][1]
+    last_minus_di = dx_values[period - 1][2]
+
+    for dx, plus_di, minus_di in dx_values[period:]:
+        adx = ((adx * (period - 1)) + dx) / period
+        last_plus_di = plus_di
+        last_minus_di = minus_di
+
+    return {
+        "adx": adx,
+        "plus_di": last_plus_di,
+        "minus_di": last_minus_di,
+    }
+
+
+def candle_wick_confirmation(candle):
+    """
+    فیلتر سایه:
+    SELL: سایه پایین بسیار بزرگ = احتمال جذب فروش و ورود خریدار در کف.
+    BUY: سایه بالا بسیار بزرگ = احتمال جذب خرید و ورود فروشنده در سقف.
+    """
+    high = candle["high"]
+    low = candle["low"]
+    open_price = candle["open"]
+    close_price = candle["close"]
+
+    body = abs(close_price - open_price)
+
+    upper_wick = high - max(open_price, close_price)
+    lower_wick = min(open_price, close_price) - low
+
+    if body <= 0:
+        return {
+            "buy_ok": False,
+            "sell_ok": False,
+            "body": body,
+            "upper_wick": upper_wick,
+            "lower_wick": lower_wick,
+        }
+
+    sell_rejected = lower_wick > (body * WICK_TO_BODY_MAX)
+    buy_rejected = upper_wick > (body * WICK_TO_BODY_MAX)
+
+    return {
+        "buy_ok": not buy_rejected,
+        "sell_ok": not sell_rejected,
+        "body": body,
+        "upper_wick": upper_wick,
+        "lower_wick": lower_wick,
+    }
+
+
+# ============================================================
 # CANDLE QUALITY
 # ============================================================
 
@@ -493,9 +632,15 @@ def calculate_analysis(candles):
         ATR_PERIOD,
     )
 
+    adx_data = calculate_adx(
+        candles,
+        ADX_PERIOD,
+    )
+
     if (
         current_rsi is None
         or current_atr is None
+        or adx_data is None
     ):
         return None
 
@@ -511,6 +656,10 @@ def calculate_analysis(candles):
             "ema21": ema_slow,
             "rsi": current_rsi,
             "atr": current_atr,
+            "adx": adx_data["adx"],
+            "plus_di": adx_data["plus_di"],
+            "minus_di": adx_data["minus_di"],
+            "adx_strong": adx_data["adx"] >= MIN_ADX_FOR_SIGNAL,
             "bull": 0,
             "bear": 0,
             "trend": "خنثی",
@@ -519,8 +668,19 @@ def calculate_analysis(candles):
             "atr_valid": False,
         }
 
+    adx = adx_data["adx"]
+    plus_di = adx_data["plus_di"]
+    minus_di = adx_data["minus_di"]
+
     bull = 0
     bear = 0
+
+    # --------------------------------------------------------
+    # ADX HARD FILTER
+    # --------------------------------------------------------
+    # ADX فقط قدرت روند را می‌سنجد؛ +DI/-DI جهت را مشخص می‌کنند.
+    # برای مدل «کم ولی قوی»، زیر 25 اصلاً سیگنال نمی‌دهیم.
+    adx_strong_enough = adx >= MIN_ADX_FOR_SIGNAL
 
     # --------------------------------------------------------
     # 1. EMA ALIGNMENT = 25
@@ -531,6 +691,15 @@ def calculate_analysis(candles):
 
     elif ema_fast < ema_slow:
         bear += 25
+
+    # --------------------------------------------------------
+    # ADX DIRECTION = 10
+    # --------------------------------------------------------
+    if adx >= MIN_ADX_FOR_SIGNAL:
+        if plus_di > minus_di:
+            bull += 10
+        elif minus_di > plus_di:
+            bear += 10
 
     # --------------------------------------------------------
     # 2. PRICE VS EMA9 = 15
@@ -710,6 +879,10 @@ def calculate_analysis(candles):
         "ema21": ema_slow,
         "rsi": current_rsi,
         "atr": current_atr,
+        "adx": adx,
+        "plus_di": plus_di,
+        "minus_di": minus_di,
+        "adx_strong": adx_strong_enough,
         "bull": bull,
         "bear": bear,
         "trend": trend,
@@ -735,10 +908,23 @@ def confirm_signal(
     bear = analysis["bear"]
     score = analysis["score"]
 
+    # قدرت روند باید واقعی باشد.
+    if not analysis.get("adx_strong", False):
+        return "HOLD", 0
+
     if score < MIN_SIGNAL_SCORE:
         return "HOLD", 0
 
     if abs(bull - bear) < MIN_SCORE_MARGIN:
+        return "HOLD", 0
+
+    confirmation = candle_wick_confirmation(candles[-1])
+
+    # کندل با سایه مخالف بسیار بزرگ، تأیید مناسبی نیست.
+    if bull > bear and not confirmation["buy_ok"]:
+        return "HOLD", 0
+
+    if bear > bull and not confirmation["sell_ok"]:
         return "HOLD", 0
 
     price = analysis["price"]
@@ -757,9 +943,11 @@ def confirm_signal(
         and ema9 > ema21
         and price > ema9
         and structure == "BULLISH"
+        and plus_di > minus_di
+        and adx >= MIN_ADX_FOR_SIGNAL
         and 50 <= current_rsi <= 72
     ):
-        return "BUY", 3
+        return "BUY", 4
 
     # --------------------------------------------------------
     # SELL
@@ -771,9 +959,11 @@ def confirm_signal(
         and ema9 < ema21
         and price < ema9
         and structure == "BEARISH"
+        and minus_di > plus_di
+        and adx >= MIN_ADX_FOR_SIGNAL
         and 28 <= current_rsi <= 50
     ):
-        return "SELL", 3
+        return "SELL", 4
 
     return "HOLD", 0
 
@@ -782,6 +972,28 @@ def confirm_signal(
 # TP / SL
 # ============================================================
 
+def calculate_dynamic_targets(
+    entry_price,
+    current_atr,
+    direction="SELL",
+):
+    """
+    اهداف کاملاً پویا بر اساس ATR همان کندل بسته‌شده.
+    """
+    multipliers = (1.0, 2.0, 3.0)
+
+    if direction.upper() == "SELL":
+        return [
+            round(entry_price - (m * current_atr), 2)
+            for m in multipliers
+        ]
+
+    return [
+        round(entry_price + (m * current_atr), 2)
+        for m in multipliers
+    ]
+
+
 def calculate_levels(
     signal,
     price,
@@ -789,45 +1001,30 @@ def calculate_levels(
     support,
     resistance,
 ):
+    targets = calculate_dynamic_targets(
+        price,
+        current_atr,
+        signal,
+    )
 
     if signal == "BUY":
-
         return {
             "entry": price,
-
-            "tp1": price
-            + current_atr * TP1_ATR,
-
-            "tp2": price
-            + current_atr * TP2_ATR,
-
-            "tp3": price
-            + current_atr * TP3_ATR,
-
-            "sl": price
-            - current_atr * SL_ATR,
-
+            "tp1": targets[0],
+            "tp2": targets[1],
+            "tp3": targets[2],
+            "sl": round(price - current_atr * SL_ATR, 2),
             "support": support,
             "resistance": resistance,
         }
 
     if signal == "SELL":
-
         return {
             "entry": price,
-
-            "tp1": price
-            - current_atr * TP1_ATR,
-
-            "tp2": price
-            - current_atr * TP2_ATR,
-
-            "tp3": price
-            - current_atr * TP3_ATR,
-
-            "sl": price
-            + current_atr * SL_ATR,
-
+            "tp1": targets[0],
+            "tp2": targets[1],
+            "tp3": targets[2],
+            "sl": round(price + current_atr * SL_ATR, 2),
             "support": support,
             "resistance": resistance,
         }
@@ -916,6 +1113,9 @@ def build_message(
 📉 EMA 21: {analysis["ema21"]:.2f}
 📊 RSI: {analysis["rsi"]:.2f}
 📏 ATR: {analysis["atr"]:.2f}
+💪 ADX: {analysis["adx"]:.2f}
+🟢 +DI: {analysis["plus_di"]:.2f}
+🔴 -DI: {analysis["minus_di"]:.2f}
 
 ━━━━━━━━━━━━━━━━
 
@@ -930,7 +1130,8 @@ def build_message(
 📉 حمایت: {levels["support"]:.2f}
 📈 مقاومت: {levels["resistance"]:.2f}
 
-✅ تأیید: {confirmation_count}/3
+✅ تأیید: {confirmation_count}/4
+💪 ADX بالاتر از 25: روند قوی
 🔒 فقط بر اساس کندل بسته‌شده
 
 ⚠️ تحلیل تکنیکال است و فعلاً معامله خودکار فعال نیست.
@@ -1017,12 +1218,16 @@ def analyze(candles):
     )
 
     log.info(
-        "Bull=%d | Bear=%d | Score=%d | Trend=%s | Structure=%s | Signal=%s",
+        "Bull=%d | Bear=%d | Score=%d | Trend=%s | Structure=%s | "
+        "ADX=%.2f | +DI=%.2f | -DI=%.2f | Signal=%s",
         analysis["bull"],
         analysis["bear"],
         analysis["score"],
         analysis["trend"],
         analysis["structure"],
+        analysis["adx"],
+        analysis["plus_di"],
+        analysis["minus_di"],
         signal,
     )
 
@@ -1194,6 +1399,19 @@ def startup():
     )
     log.info(
         "One API request per 5-minute candle: ON"
+    )
+    log.info(
+        "ADX Filter: >= %.1f",
+        MIN_ADX_FOR_SIGNAL,
+    )
+    log.info(
+        "Directional DI Filter: ON"
+    )
+    log.info(
+        "Long Opposite-Wick Filter: ON"
+    )
+    log.info(
+        "Dynamic ATR Targets: 1x / 2x / 3x",
     )
 
     log.info(
