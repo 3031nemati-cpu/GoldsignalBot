@@ -32,8 +32,8 @@ REQUEST_TIMEOUT_SECONDS = 20
 MAX_CONSECUTIVE_API_FAILURES = 3
 
 # فیلتر اصلی کیفیت
-MIN_SIGNAL_SCORE = 70
-MIN_SCORE_MARGIN = 10
+MIN_SIGNAL_SCORE = 60
+MIN_SCORE_MARGIN = 5
 
 # حداکثر سن مجاز آخرین کندل بسته‌شده
 MAX_CANDLE_AGE_MINUTES = 7
@@ -942,7 +942,7 @@ def confirm_signal(
         and bull >= MIN_SIGNAL_SCORE
         and ema9 > ema21
         and price > ema9
-        and structure == "BULLISH"
+        and structure in ("BULLISH", "NEUTRAL")
         and plus_di > minus_di
         and adx >= MIN_ADX_FOR_SIGNAL
         and 50 <= current_rsi <= 72
@@ -958,7 +958,7 @@ def confirm_signal(
         and bear >= MIN_SIGNAL_SCORE
         and ema9 < ema21
         and price < ema9
-        and structure == "BEARISH"
+        and structure in ("BEARISH", "NEUTRAL")
         and minus_di > plus_di
         and adx >= MIN_ADX_FOR_SIGNAL
         and 28 <= current_rsi <= 50
