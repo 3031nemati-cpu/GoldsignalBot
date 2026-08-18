@@ -5,66 +5,80 @@ from datetime import datetime, timezone
 
 import requests
 
+
 # ============================================================
-# GOLD SIGNAL BOT - STRONG SIGNAL MODE
+# GOLD SIGNAL BOT - PROFESSIONAL v3
 # ============================================================
-# هدف این نسخه:
-# - سیگنال کمتر، اما قوی‌تر و کنترل‌شده‌تر
-# - فقط تحلیل کندل 5 دقیقه‌ای کاملاً بسته‌شده
-# - حذف زمان UTC/تهران از پیام تلگرام
-# - حذف پیام‌های HOLD
-# - جلوگیری از سیگنال‌های تکراری و ضعیف
-# - معاملات خودکار فعلاً خاموش است
+# XAU/USD - 5 Minute
+#
+# Indicators:
+# EMA 9 / EMA 21
+# RSI 14
+# ATR 14
+# ADX 14
+# +DI / -DI
+#
+# Features:
+# - Closed candle protection
+# - Dynamic ATR targets
+# - Dynamic Stop Loss
+# - Controlled signal scoring
+# - ADX as trend-strength filter, NOT a hard blocker
+# - Candle confirmation
+# - Extreme wick protection
+# - Duplicate candle protection
+# - Telegram Persian messages
+# - Telegram error diagnostics
+# - Automatic trading OFF
+# - HOLD messages OFF
+# - Reduced API requests to avoid rate limiting
+# ============================================================
+
+
+# ============================================================
+# CONFIGURATION
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 API_KEY = os.getenv("API_KEY")
 
+
 SYMBOL = "XAU/USD"
 INTERVAL = "5min"
 
-# فقط یک بار برای هر کندل 5 دقیقه‌ای از Twelve Data داده می‌گیریم.
-# این کار مصرف API را از حدود 1440 درخواست روزانه به حدود 288 می‌رساند.
-CANDLE_SECONDS = 300
-FETCH_DELAY_AFTER_CLOSE_SECONDS = 75
-REQUEST_TIMEOUT_SECONDS = 20
-MAX_CONSECUTIVE_API_FAILURES = 3
 
-# فیلتر اصلی کیفیت
+# IMPORTANT:
+# Do not check Twelve Data every 30 seconds.
+# It can cause "Many Requests".
+CHECK_SECONDS = 300
+
+
+# Minimum total score required
 MIN_SIGNAL_SCORE = 60
-MIN_SCORE_MARGIN = 5
 
-# حداکثر سن مجاز آخرین کندل بسته‌شده
-MAX_CANDLE_AGE_MINUTES = 7
 
-EMA_FAST = 9
-EMA_SLOW = 21
-RSI_PERIOD = 14
-ATR_PERIOD = 14
+# Minimum difference between BUY and SELL scores
+MIN_DIRECTION_GAP = 5
 
-# ADX / Directional Movement
-ADX_PERIOD = 14
-MIN_ADX_FOR_SIGNAL = 25.0
-STRONG_ADX = 30.0
 
-# فیلتر سایه کندل تأییدیه
-# اگر سایه مخالف جهت معامله بیش از 150% بدنه باشد، سیگنال رد می‌شود.
-# مثال SELL: سایه پایین > 1.5 × بدنه => ورود خریداران در کف => رد SELL
-WICK_TO_BODY_MAX = 1.50
+# Maximum acceptable age of the latest closed candle
+MAX_CANDLE_AGE_MINUTES = 8
 
-# اهداف و حد ضرر بر اساس ATR
+
+# ATR targets
 TP1_ATR = 1.0
 TP2_ATR = 2.0
 TP3_ATR = 3.0
+
+# Stop Loss
 SL_ATR = 1.5
 
-# جلوگیری از ورود در ATR غیرعادی
-MIN_ATR = 0.10
-MAX_ATR = 20.0
 
-# فعلاً خاموش؛ بعد از تست دمو می‌توان فعال کرد.
+# Automatic trading remains OFF
 AUTOMATIC_TRADING = False
+
+# Do not send HOLD messages
 SEND_HOLD_MESSAGES = False
 
 
@@ -74,7 +88,7 @@ SEND_HOLD_MESSAGES = False
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s UTC | %(levelname)s | %(message)s",
+    format="%(asctime)s UTC | %(levelname)s | %(message)s"
 )
 
 log = logging.getLogger("GoldSignalBot")
@@ -84,13 +98,14 @@ log = logging.getLogger("GoldSignalBot")
 # ENVIRONMENT CHECK
 # ============================================================
 
-for name, value in (
-    ("BOT_TOKEN", BOT_TOKEN),
-    ("CHAT_ID", CHAT_ID),
-    ("API_KEY", API_KEY),
-):
-    if not value:
-        raise RuntimeError(f"{name} is missing")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing")
+
+if not CHAT_ID:
+    raise RuntimeError("CHAT_ID is missing")
+
+if not API_KEY:
+    raise RuntimeError("API_KEY is missing")
 
 
 # ============================================================
@@ -98,25 +113,19 @@ for name, value in (
 # ============================================================
 
 session = requests.Session()
-session.headers.update(
-    {"User-Agent": "GoldSignalBot/StrongSignals/2.0"}
-)
+
+session.headers.update({
+    "User-Agent": "GoldSignalBot/3.0"
+})
 
 
 # ============================================================
-# MEMORY
+# STATE
 # ============================================================
 
 last_processed_candle = None
-
-last_sent_signal = None
 last_sent_candle = None
-last_sent_price = None
-last_sent_score = None
-
-# زمان درخواست بعدی داده از Twelve Data
-next_fetch_time = 0.0
-consecutive_api_failures = 0
+last_sent_signal = None
 
 
 # ============================================================
@@ -124,63 +133,85 @@ consecutive_api_failures = 0
 # ============================================================
 
 def send_telegram(message):
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     try:
+
         response = session.post(
             url,
             data={
                 "chat_id": CHAT_ID,
-                "text": message,
+                "text": message
             },
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=20
         )
-
-        if response.status_code == 429:
-            log.error(
-                "Telegram HTTP 429: rate limit reached."
-            )
-            return False
 
         response.raise_for_status()
 
         data = response.json()
 
         if not data.get("ok"):
-            log.error("Telegram error: %s", data)
+
+            log.error(
+                "Telegram API rejected message: %s",
+                data
+            )
+
             return False
 
-        log.info("Telegram signal sent.")
+        log.info("Telegram message sent successfully.")
+
         return True
 
-    except Exception as exc:
-        log.error("Telegram error: %s", exc)
+    except requests.exceptions.RequestException as e:
+
+        log.error(
+            "Telegram connection error: %s",
+            e
+        )
+
+        return False
+
+    except Exception as e:
+
+        log.exception(
+            "Telegram unexpected error: %s",
+            e
+        )
+
         return False
 
 
 # ============================================================
-# TIME PARSER
+# DATE PARSER
 # ============================================================
 
 def parse_utc(value):
-    value = str(value).strip()
 
-    if value.endswith("Z"):
-        value = value[:-1] + "+00:00"
+    try:
 
-    dt = datetime.fromisoformat(value)
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
 
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(value)
 
-    return dt.astimezone(timezone.utc)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        return dt.astimezone(timezone.utc)
+
+    except Exception:
+
+        return None
 
 
 # ============================================================
-# TWELVE DATA
+# MARKET DATA
 # ============================================================
 
-def get_candles(outputsize=150):
+def get_candles(outputsize=100):
+
     url = "https://api.twelvedata.com/time_series"
 
     params = {
@@ -189,62 +220,120 @@ def get_candles(outputsize=150):
         "outputsize": outputsize,
         "apikey": API_KEY,
         "timezone": "UTC",
-        "format": "JSON",
+        "format": "JSON"
     }
 
     try:
+
         response = session.get(
             url,
             params=params,
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=20
         )
-
-        if response.status_code == 429:
-            log.error("Twelve Data HTTP 429: API limit reached. No rapid retry.")
-            return []
 
         response.raise_for_status()
 
         data = response.json()
 
+        # Twelve Data error
         if data.get("status") == "error":
-            safe_data = dict(data) if isinstance(data, dict) else data
-            if isinstance(safe_data, dict):
-                safe_data.pop("apikey", None)
-            log.error("Twelve Data error: %s", safe_data)
+
+            log.error(
+                "Twelve Data error: %s",
+                data
+            )
+
             return []
 
-        if "values" not in data:
-            log.error("Twelve Data returned no values: %s", data)
+        # Rate limit / API message
+        if "message" in data and "values" not in data:
+
+            log.error(
+                "Twelve Data message: %s",
+                data.get("message")
+            )
+
             return []
 
-        candles = []
+        values = data.get("values", [])
 
-        for item in data["values"]:
+        if not values:
+
+            log.warning(
+                "Twelve Data returned zero candles."
+            )
+
+            return []
+
+        result = []
+
+        for item in values:
+
             try:
-                candles.append(
-                    {
-                        "datetime": parse_utc(item["datetime"]),
-                        "open": float(item["open"]),
-                        "high": float(item["high"]),
-                        "low": float(item["low"]),
-                        "close": float(item["close"]),
-                    }
+
+                dt = parse_utc(
+                    item["datetime"]
                 )
 
-            except (KeyError, TypeError, ValueError):
+                if dt is None:
+                    continue
+
+                result.append({
+
+                    "datetime": dt,
+
+                    "open": float(
+                        item["open"]
+                    ),
+
+                    "high": float(
+                        item["high"]
+                    ),
+
+                    "low": float(
+                        item["low"]
+                    ),
+
+                    "close": float(
+                        item["close"]
+                    )
+                })
+
+            except (
+                KeyError,
+                ValueError,
+                TypeError
+            ):
+
                 continue
 
-        candles.sort(key=lambda item: item["datetime"])
+        result.sort(
+            key=lambda x: x["datetime"]
+        )
 
-        return candles
+        log.info(
+            "Market data received: %d candles",
+            len(result)
+        )
 
-    except requests.RequestException as exc:
-        log.error("Market data request error: %s", exc)
+        return result
+
+    except requests.exceptions.RequestException as e:
+
+        log.error(
+            "Market data request failed: %s",
+            e
+        )
+
         return []
 
-    except Exception as exc:
-        log.error("Market data error: %s", exc)
+    except Exception as e:
+
+        log.exception(
+            "Market data unexpected error: %s",
+            e
+        )
+
         return []
 
 
@@ -253,31 +342,45 @@ def get_candles(outputsize=150):
 # ============================================================
 
 def get_closed_candles(candles):
+
     now = datetime.now(timezone.utc)
 
     closed = []
 
     for candle in candles:
 
-        # XAU/USD 5-minute candle
-        # datetime = opening time of candle
-        close_time = candle["datetime"].timestamp() + 300
+        # 5 minute candle
+        close_time = (
+            candle["datetime"].timestamp()
+            + 300
+        )
 
         if now.timestamp() >= close_time:
+
             closed.append(candle)
 
     return closed
 
 
+# ============================================================
+# CANDLE AGE
+# ============================================================
+
 def candle_age_minutes(candle):
+
     now = datetime.now(timezone.utc)
 
-    close_time = candle["datetime"].timestamp() + 300
-
-    return max(
-        0.0,
-        (now.timestamp() - close_time) / 60.0,
+    close_time = (
+        candle["datetime"].timestamp()
+        + 300
     )
+
+    age = (
+        now.timestamp()
+        - close_time
+    ) / 60
+
+    return max(0.0, age)
 
 
 # ============================================================
@@ -285,24 +388,33 @@ def candle_age_minutes(candle):
 # ============================================================
 
 def ema_series(values, period):
+
     if len(values) < period:
+
         return []
 
     multiplier = 2 / (period + 1)
 
-    current = sum(values[:period]) / period
+    initial = sum(
+        values[:period]
+    ) / period
 
-    result = [None] * (period - 1)
+    result = (
+        [None] * (period - 1)
+        + [initial]
+    )
 
-    result.append(current)
+    value = initial
 
     for price in values[period:]:
 
-        current = (
-            (price - current) * multiplier
-        ) + current
+        value = (
+            (price - value)
+            * multiplier
+            + value
+        )
 
-        result.append(current)
+        result.append(value)
 
     return result
 
@@ -311,43 +423,69 @@ def ema_series(values, period):
 # RSI
 # ============================================================
 
-def rsi(values, period=14):
+def calculate_rsi(values, period=14):
 
     if len(values) < period + 1:
+
         return None
 
     gains = []
     losses = []
 
-    for index in range(1, len(values)):
+    for i in range(1, len(values)):
 
-        change = values[index] - values[index - 1]
+        change = (
+            values[i]
+            - values[i - 1]
+        )
 
-        gains.append(max(change, 0.0))
-        losses.append(max(-change, 0.0))
+        gains.append(
+            max(change, 0)
+        )
 
-    average_gain = sum(gains[:period]) / period
-    average_loss = sum(losses[:period]) / period
+        losses.append(
+            max(-change, 0)
+        )
 
-    for index in range(period, len(gains)):
+    avg_gain = (
+        sum(gains[:period])
+        / period
+    )
 
-        average_gain = (
-            (average_gain * (period - 1))
-            + gains[index]
+    avg_loss = (
+        sum(losses[:period])
+        / period
+    )
+
+    for i in range(
+        period,
+        len(gains)
+    ):
+
+        avg_gain = (
+            (
+                avg_gain
+                * (period - 1)
+            )
+            + gains[i]
         ) / period
 
-        average_loss = (
-            (average_loss * (period - 1))
-            + losses[index]
+        avg_loss = (
+            (
+                avg_loss
+                * (period - 1)
+            )
+            + losses[i]
         ) / period
 
-    if average_loss == 0:
+    if avg_loss == 0:
+
         return 100.0
 
-    relative_strength = average_gain / average_loss
+    rs = avg_gain / avg_loss
 
-    return 100.0 - (
-        100.0 / (1.0 + relative_strength)
+    return 100 - (
+        100 / (1 + rs)
     )
 
 
@@ -355,239 +493,343 @@ def rsi(values, period=14):
 # ATR
 # ============================================================
 
-def atr(candles, period=14):
+def calculate_atr(candles, period=14):
 
     if len(candles) < period + 1:
+
         return None
 
     true_ranges = []
 
-    for index in range(1, len(candles)):
+    for i in range(
+        1,
+        len(candles)
+    ):
 
-        high = candles[index]["high"]
-        low = candles[index]["low"]
-        previous_close = candles[index - 1]["close"]
+        high = candles[i]["high"]
+        low = candles[i]["low"]
 
-        true_range = max(
-            high - low,
-            abs(high - previous_close),
-            abs(low - previous_close),
+        previous_close = (
+            candles[i - 1]["close"]
         )
 
-        true_ranges.append(true_range)
+        tr = max(
 
-    value = sum(
-        true_ranges[:period]
-    ) / period
+            high - low,
 
-    for true_range in true_ranges[period:]:
+            abs(
+                high
+                - previous_close
+            ),
 
-        value = (
-            (value * (period - 1))
-            + true_range
+            abs(
+                low
+                - previous_close
+            )
+        )
+
+        true_ranges.append(tr)
+
+    atr_value = (
+        sum(
+            true_ranges[:period]
+        ) / period
+    )
+
+    for tr in true_ranges[period:]:
+
+        atr_value = (
+            (
+                atr_value
+                * (period - 1)
+            )
+            + tr
         ) / period
 
-    return value
+    return atr_value
 
 
 # ============================================================
-# ADX / DIRECTIONAL MOVEMENT
+# ADX / DI
 # ============================================================
 
 def calculate_adx(candles, period=14):
-    """
-    ADX به روش Wilder:
-    - ADX قدرت روند را اندازه می‌گیرد، نه جهت آن.
-    - +DI و -DI جهت غالب روند را مشخص می‌کنند.
-    """
-    if len(candles) < (period * 2) + 1:
+
+    if len(candles) < (
+        period * 2 + 1
+    ):
+
         return None
 
     tr_values = []
-    plus_dm_values = []
-    minus_dm_values = []
+    plus_dm = []
+    minus_dm = []
 
-    for i in range(1, len(candles)):
-        high = candles[i]["high"]
-        low = candles[i]["low"]
-        prev_high = candles[i - 1]["high"]
-        prev_low = candles[i - 1]["low"]
-        prev_close = candles[i - 1]["close"]
+    for i in range(
+        1,
+        len(candles)
+    ):
 
-        up_move = high - prev_high
-        down_move = prev_low - low
+        current = candles[i]
+        previous = candles[i - 1]
 
-        plus_dm = up_move if up_move > down_move and up_move > 0 else 0.0
-        minus_dm = down_move if down_move > up_move and down_move > 0 else 0.0
+        high = current["high"]
+        low = current["low"]
 
-        true_range = max(
+        previous_high = previous["high"]
+        previous_low = previous["low"]
+        previous_close = previous["close"]
+
+        tr = max(
+
             high - low,
-            abs(high - prev_close),
-            abs(low - prev_close),
+
+            abs(
+                high
+                - previous_close
+            ),
+
+            abs(
+                low
+                - previous_close
+            )
         )
 
-        tr_values.append(true_range)
-        plus_dm_values.append(plus_dm)
-        minus_dm_values.append(minus_dm)
+        up_move = (
+            high - previous_high
+        )
+
+        down_move = (
+            previous_low - low
+        )
+
+        if (
+            up_move > down_move
+            and up_move > 0
+        ):
+
+            p_dm = up_move
+
+        else:
+
+            p_dm = 0.0
+
+        if (
+            down_move > up_move
+            and down_move > 0
+        ):
+
+            m_dm = down_move
+
+        else:
+
+            m_dm = 0.0
+
+        tr_values.append(tr)
+        plus_dm.append(p_dm)
+        minus_dm.append(m_dm)
 
     if len(tr_values) < period:
+
         return None
 
-    atr_w = sum(tr_values[:period])
-    plus_dm_w = sum(plus_dm_values[:period])
-    minus_dm_w = sum(minus_dm_values[:period])
+    atr_smoothed = (
+        sum(tr_values[:period])
+        / period
+    )
+
+    plus_smoothed = (
+        sum(plus_dm[:period])
+        / period
+    )
+
+    minus_smoothed = (
+        sum(minus_dm[:period])
+        / period
+    )
 
     dx_values = []
 
-    for i in range(period, len(tr_values)):
-        atr_w = atr_w - (atr_w / period) + tr_values[i]
-        plus_dm_w = plus_dm_w - (plus_dm_w / period) + plus_dm_values[i]
-        minus_dm_w = minus_dm_w - (minus_dm_w / period) + minus_dm_values[i]
+    for i in range(
+        period,
+        len(tr_values)
+    ):
 
-        if atr_w <= 0:
-            continue
+        atr_smoothed = (
+            (
+                atr_smoothed
+                * (period - 1)
+            )
+            + tr_values[i]
+        ) / period
 
-        plus_di = 100.0 * plus_dm_w / atr_w
-        minus_di = 100.0 * minus_dm_w / atr_w
+        plus_smoothed = (
+            (
+                plus_smoothed
+                * (period - 1)
+            )
+            + plus_dm[i]
+        ) / period
 
-        di_sum = plus_di + minus_di
+        minus_smoothed = (
+            (
+                minus_smoothed
+                * (period - 1)
+            )
+            + minus_dm[i]
+        ) / period
 
-        if di_sum <= 0:
-            dx = 0.0
+        if atr_smoothed == 0:
+
+            plus_di = 0
+            minus_di = 0
+
         else:
-            dx = 100.0 * abs(plus_di - minus_di) / di_sum
 
-        dx_values.append((dx, plus_di, minus_di))
+            plus_di = (
+                100
+                * plus_smoothed
+                / atr_smoothed
+            )
+
+            minus_di = (
+                100
+                * minus_smoothed
+                / atr_smoothed
+            )
+
+        denominator = (
+            plus_di
+            + minus_di
+        )
+
+        if denominator == 0:
+
+            dx = 0
+
+        else:
+
+            dx = (
+                100
+                * abs(
+                    plus_di
+                    - minus_di
+                )
+                / denominator
+            )
+
+        dx_values.append(
+            (
+                dx,
+                plus_di,
+                minus_di
+            )
+        )
 
     if len(dx_values) < period:
+
         return None
 
-    adx = sum(x[0] for x in dx_values[:period]) / period
+    adx = sum(
+        x[0]
+        for x in dx_values[:period]
+    ) / period
 
-    last_plus_di = dx_values[period - 1][1]
-    last_minus_di = dx_values[period - 1][2]
+    latest_plus_di = dx_values[-1][1]
+    latest_minus_di = dx_values[-1][2]
 
-    for dx, plus_di, minus_di in dx_values[period:]:
-        adx = ((adx * (period - 1)) + dx) / period
-        last_plus_di = plus_di
-        last_minus_di = minus_di
+    for i in range(
+        period,
+        len(dx_values)
+    ):
+
+        adx = (
+            (
+                adx
+                * (period - 1)
+            )
+            + dx_values[i][0]
+        ) / period
 
     return {
         "adx": adx,
-        "plus_di": last_plus_di,
-        "minus_di": last_minus_di,
-    }
-
-
-def candle_wick_confirmation(candle):
-    """
-    فیلتر سایه:
-    SELL: سایه پایین بسیار بزرگ = احتمال جذب فروش و ورود خریدار در کف.
-    BUY: سایه بالا بسیار بزرگ = احتمال جذب خرید و ورود فروشنده در سقف.
-    """
-    high = candle["high"]
-    low = candle["low"]
-    open_price = candle["open"]
-    close_price = candle["close"]
-
-    body = abs(close_price - open_price)
-
-    upper_wick = high - max(open_price, close_price)
-    lower_wick = min(open_price, close_price) - low
-
-    if body <= 0:
-        return {
-            "buy_ok": False,
-            "sell_ok": False,
-            "body": body,
-            "upper_wick": upper_wick,
-            "lower_wick": lower_wick,
-        }
-
-    sell_rejected = lower_wick > (body * WICK_TO_BODY_MAX)
-    buy_rejected = upper_wick > (body * WICK_TO_BODY_MAX)
-
-    return {
-        "buy_ok": not buy_rejected,
-        "sell_ok": not sell_rejected,
-        "body": body,
-        "upper_wick": upper_wick,
-        "lower_wick": lower_wick,
+        "plus_di": latest_plus_di,
+        "minus_di": latest_minus_di
     }
 
 
 # ============================================================
-# CANDLE QUALITY
+# CANDLE INFORMATION
 # ============================================================
 
-def candle_body_ratio(candle):
+def candle_direction(candle):
 
-    candle_range = candle["high"] - candle["low"]
+    if candle["close"] > candle["open"]:
+        return "BULLISH"
 
-    if candle_range <= 0:
-        return 0.0
+    if candle["close"] < candle["open"]:
+        return "BEARISH"
+
+    return "NEUTRAL"
+
+
+# ============================================================
+# WICK ANALYSIS
+# ============================================================
+
+def candle_wick_data(candle):
 
     body = abs(
-        candle["close"] - candle["open"]
+        candle["close"]
+        - candle["open"]
     )
 
-    return body / candle_range
+    upper_wick = (
+        candle["high"]
+        - max(
+            candle["open"],
+            candle["close"]
+        )
+    )
+
+    lower_wick = (
+        min(
+            candle["open"],
+            candle["close"]
+        )
+        - candle["low"]
+    )
+
+    total_range = (
+        candle["high"]
+        - candle["low"]
+    )
+
+    if total_range <= 0:
+
+        return {
+            "body": 0,
+            "upper": 0,
+            "lower": 0,
+            "range": 0
+        }
+
+    return {
+        "body": body,
+        "upper": upper_wick,
+        "lower": lower_wick,
+        "range": total_range
+    }
 
 
 # ============================================================
-# MARKET STRUCTURE
-# ============================================================
-
-def calculate_market_structure(candles):
-
-    if len(candles) < 12:
-        return "NEUTRAL", 0
-
-    recent = candles[-6:]
-    previous = candles[-12:-6]
-
-    recent_high = max(
-        c["high"] for c in recent
-    )
-
-    recent_low = min(
-        c["low"] for c in recent
-    )
-
-    previous_high = max(
-        c["high"] for c in previous
-    )
-
-    previous_low = min(
-        c["low"] for c in previous
-    )
-
-    bullish = (
-        recent_high > previous_high
-        and recent_low > previous_low
-    )
-
-    bearish = (
-        recent_high < previous_high
-        and recent_low < previous_low
-    )
-
-    if bullish:
-        return "BULLISH", 15
-
-    if bearish:
-        return "BEARISH", 15
-
-    return "NEUTRAL", 0
-
-
-# ============================================================
-# MAIN ANALYSIS
+# ANALYSIS
 # ============================================================
 
 def calculate_analysis(candles):
 
-    if len(candles) < 60:
+    if len(candles) < 50:
+
         return None
 
     closes = [
@@ -595,78 +837,58 @@ def calculate_analysis(candles):
         for c in candles
     ]
 
-    fast_series = ema_series(
+    ema9_series = ema_series(
         closes,
-        EMA_FAST,
+        9
     )
 
-    slow_series = ema_series(
+    ema21_series = ema_series(
         closes,
-        EMA_SLOW,
+        21
     )
 
     if (
-        len(fast_series) < 4
-        or len(slow_series) < 4
+        len(ema9_series) < 2
+        or len(ema21_series) < 2
     ):
+
         return None
 
-    ema_fast = fast_series[-1]
-    ema_slow = slow_series[-1]
+    ema9 = ema9_series[-1]
+    ema21 = ema21_series[-1]
 
-    previous_fast = fast_series[-2]
-    previous_slow = slow_series[-2]
+    previous_ema9 = (
+        ema9_series[-2]
+    )
 
-    older_fast = fast_series[-4]
-    older_slow = slow_series[-4]
+    previous_ema21 = (
+        ema21_series[-2]
+    )
 
     price = closes[-1]
 
-    current_rsi = rsi(
+    rsi = calculate_rsi(
         closes,
-        RSI_PERIOD,
+        14
     )
 
-    current_atr = atr(
+    atr = calculate_atr(
         candles,
-        ATR_PERIOD,
+        14
     )
 
     adx_data = calculate_adx(
         candles,
-        ADX_PERIOD,
+        14
     )
 
     if (
-        current_rsi is None
-        or current_atr is None
+        rsi is None
+        or atr is None
         or adx_data is None
     ):
+
         return None
-
-    if not (
-        MIN_ATR
-        <= current_atr
-        <= MAX_ATR
-    ):
-
-        return {
-            "price": price,
-            "ema9": ema_fast,
-            "ema21": ema_slow,
-            "rsi": current_rsi,
-            "atr": current_atr,
-            "adx": adx_data["adx"],
-            "plus_di": adx_data["plus_di"],
-            "minus_di": adx_data["minus_di"],
-            "adx_strong": adx_data["adx"] >= MIN_ADX_FOR_SIGNAL,
-            "bull": 0,
-            "bear": 0,
-            "trend": "خنثی",
-            "score": 0,
-            "structure": "NEUTRAL",
-            "atr_valid": False,
-        }
 
     adx = adx_data["adx"]
     plus_di = adx_data["plus_di"]
@@ -676,162 +898,201 @@ def calculate_analysis(candles):
     bear = 0
 
     # --------------------------------------------------------
-    # ADX HARD FILTER
-    # --------------------------------------------------------
-    # ADX فقط قدرت روند را می‌سنجد؛ +DI/-DI جهت را مشخص می‌کنند.
-    # برای مدل «کم ولی قوی»، زیر 25 اصلاً سیگنال نمی‌دهیم.
-    adx_strong_enough = adx >= MIN_ADX_FOR_SIGNAL
-
-    # --------------------------------------------------------
-    # 1. EMA ALIGNMENT = 25
+    # EMA TREND
     # --------------------------------------------------------
 
-    if ema_fast > ema_slow:
-        bull += 25
+    if ema9 > ema21:
 
-    elif ema_fast < ema_slow:
-        bear += 25
+        bull += 20
+
+    elif ema9 < ema21:
+
+        bear += 20
+
 
     # --------------------------------------------------------
-    # ADX DIRECTION = 10
+    # PRICE POSITION
     # --------------------------------------------------------
-    if adx >= MIN_ADX_FOR_SIGNAL:
+
+    if price > ema9:
+
+        bull += 15
+
+    elif price < ema9:
+
+        bear += 15
+
+
+    # --------------------------------------------------------
+    # EMA MOMENTUM
+    # --------------------------------------------------------
+
+    if ema9 > previous_ema9:
+
+        bull += 10
+
+    elif ema9 < previous_ema9:
+
+        bear += 10
+
+
+    if ema21 > previous_ema21:
+
+        bull += 5
+
+    elif ema21 < previous_ema21:
+
+        bear += 5
+
+
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    if 52 <= rsi <= 68:
+
+        bull += 15
+
+    elif 32 <= rsi <= 48:
+
+        bear += 15
+
+    elif 48 < rsi < 52:
+
+        # Neutral RSI
+        pass
+
+    # Extreme RSI is not automatically a reversal
+    # but reduces confidence.
+
+    if rsi >= 75:
+
+        bull -= 5
+
+    if rsi <= 25:
+
+        bear -= 5
+
+
+    # --------------------------------------------------------
+    # ADX
+    # --------------------------------------------------------
+    # ADX measures strength, not direction.
+    #
+    # ADX >= 25:
+    # strong trend
+    #
+    # ADX 20-25:
+    # moderate trend
+    #
+    # ADX < 20:
+    # ranging market
+    #
+    # IMPORTANT:
+    # ADX < 20 DOES NOT completely block the signal.
+    # It only reduces confidence.
+    # This prevents the bot from becoming silent.
+    # --------------------------------------------------------
+
+    if adx >= 25:
+
         if plus_di > minus_di:
-            bull += 10
+
+            bull += 15
+
         elif minus_di > plus_di:
-            bear += 10
 
-    # --------------------------------------------------------
-    # 2. PRICE VS EMA9 = 15
-    # --------------------------------------------------------
+            bear += 15
 
-    if price > ema_fast:
-        bull += 15
+    elif adx >= 20:
 
-    elif price < ema_fast:
-        bear += 15
+        if plus_di > minus_di:
 
-    # --------------------------------------------------------
-    # 3. EMA9 SLOPE = 10
-    # --------------------------------------------------------
-
-    if ema_fast > previous_fast:
-        bull += 10
-
-    elif ema_fast < previous_fast:
-        bear += 10
-
-    # --------------------------------------------------------
-    # 4. EMA21 SLOPE = 10
-    # --------------------------------------------------------
-
-    if ema_slow > previous_slow:
-        bull += 10
-
-    elif ema_slow < previous_slow:
-        bear += 10
-
-    # --------------------------------------------------------
-    # 5. RSI = 15
-    # --------------------------------------------------------
-
-    if 52 <= current_rsi <= 68:
-        bull += 15
-
-    elif 32 <= current_rsi <= 48:
-        bear += 15
-
-    elif 68 < current_rsi <= 72:
-        if ema_fast > ema_slow:
             bull += 8
 
-    elif 28 <= current_rsi < 32:
-        if ema_fast < ema_slow:
+        elif minus_di > plus_di:
+
             bear += 8
 
-    # جلوگیری از ورود خیلی دیرهنگام
-    if current_rsi > 75:
-        bull = max(
-            0,
-            bull - 15,
-        )
+    else:
 
-    if current_rsi < 25:
-        bear = max(
-            0,
-            bear - 15,
-        )
+        # Weak trend / range
+        # Small directional contribution only
 
-    # --------------------------------------------------------
-    # 6. MARKET STRUCTURE = 15
-    # --------------------------------------------------------
+        if plus_di > minus_di:
 
-    structure, structure_score = (
-        calculate_market_structure(candles)
-    )
+            bull += 3
 
-    if structure == "BULLISH":
-        bull += structure_score
+        elif minus_di > plus_di:
 
-    elif structure == "BEARISH":
-        bear += structure_score
+            bear += 3
+
 
     # --------------------------------------------------------
-    # 7. CANDLE QUALITY = 10
+    # DI DIRECTION
+    # --------------------------------------------------------
+
+    if plus_di > minus_di:
+
+        bull += 5
+
+    elif minus_di > plus_di:
+
+        bear += 5
+
+
+    # --------------------------------------------------------
+    # LATEST CANDLE
     # --------------------------------------------------------
 
     latest = candles[-1]
 
-    body_ratio = candle_body_ratio(
+    direction = candle_direction(
         latest
     )
 
-    if body_ratio >= 0.55:
+    if direction == "BULLISH":
 
-        if latest["close"] > latest["open"]:
-            bull += 10
+        bull += 10
 
-        elif latest["close"] < latest["open"]:
-            bear += 10
+    elif direction == "BEARISH":
 
-    # مهم:
-    # یک کندل اصلاحی کوچک، روند قوی را به تنهایی حذف نمی‌کند.
+        bear += 10
+
 
     # --------------------------------------------------------
-    # 8. EMA MOMENTUM = 5
+    # SECOND LAST CANDLE
     # --------------------------------------------------------
 
-    fast_rising = (
-        ema_fast > older_fast
+    previous = candles[-2]
+
+    previous_direction = (
+        candle_direction(previous)
     )
 
-    fast_falling = (
-        ema_fast < older_fast
-    )
+    if previous_direction == "BULLISH":
 
-    slow_rising = (
-        ema_slow > older_slow
-    )
-
-    slow_falling = (
-        ema_slow < older_slow
-    )
-
-    if fast_rising and slow_rising:
         bull += 5
 
-    if fast_falling and slow_falling:
+    elif previous_direction == "BEARISH":
+
         bear += 5
 
-    bull = min(
-        100,
-        bull,
+
+    # --------------------------------------------------------
+    # LIMIT SCORES
+    # --------------------------------------------------------
+
+    bull = max(
+        0,
+        min(100, bull)
     )
 
-    bear = min(
-        100,
-        bear,
+    bear = max(
+        0,
+        min(100, bear)
     )
+
 
     # --------------------------------------------------------
     # TREND
@@ -841,54 +1102,65 @@ def calculate_analysis(candles):
 
         score = bull
 
-        if score >= 85:
-            trend = "صعودی بسیار قوی"
+        if score >= 80:
 
-        elif score >= 70:
             trend = "صعودی قوی"
 
         elif score >= 60:
+
             trend = "صعودی"
 
         else:
+
             trend = "خنثی"
 
     elif bear > bull:
 
         score = bear
 
-        if score >= 85:
-            trend = "نزولی بسیار قوی"
+        if score >= 80:
 
-        elif score >= 70:
             trend = "نزولی قوی"
 
         elif score >= 60:
+
             trend = "نزولی"
 
         else:
+
             trend = "خنثی"
 
     else:
+
         score = 0
         trend = "خنثی"
 
+
     return {
+
         "price": price,
-        "ema9": ema_fast,
-        "ema21": ema_slow,
-        "rsi": current_rsi,
-        "atr": current_atr,
+
+        "ema9": ema9,
+
+        "ema21": ema21,
+
+        "rsi": rsi,
+
+        "atr": atr,
+
         "adx": adx,
+
         "plus_di": plus_di,
+
         "minus_di": minus_di,
-        "adx_strong": adx_strong_enough,
+
         "bull": bull,
+
         "bear": bear,
-        "trend": trend,
+
         "score": int(score),
-        "structure": structure,
-        "atr_valid": True,
+
+        "trend": trend
     }
 
 
@@ -896,42 +1168,16 @@ def calculate_analysis(candles):
 # SIGNAL CONFIRMATION
 # ============================================================
 
-def confirm_signal(
-    candles,
-    analysis,
-):
+def confirm_signal(candles, analysis):
 
-    if not analysis["atr_valid"]:
-        return "HOLD", 0
+    latest = candles[-1]
+
+    direction = candle_direction(
+        latest
+    )
 
     bull = analysis["bull"]
     bear = analysis["bear"]
-    score = analysis["score"]
-
-    # قدرت روند باید واقعی باشد.
-    if not analysis.get("adx_strong", False):
-        return "HOLD", 0
-
-    if score < MIN_SIGNAL_SCORE:
-        return "HOLD", 0
-
-    if abs(bull - bear) < MIN_SCORE_MARGIN:
-        return "HOLD", 0
-
-    confirmation = candle_wick_confirmation(candles[-1])
-
-    # کندل با سایه مخالف بسیار بزرگ، تأیید مناسبی نیست.
-    if bull > bear and not confirmation["buy_ok"]:
-        return "HOLD", 0
-
-    if bear > bull and not confirmation["sell_ok"]:
-        return "HOLD", 0
-
-    price = analysis["price"]
-    ema9 = analysis["ema9"]
-    ema21 = analysis["ema21"]
-    current_rsi = analysis["rsi"]
-    structure = analysis["structure"]
 
     # --------------------------------------------------------
     # BUY
@@ -939,15 +1185,15 @@ def confirm_signal(
 
     if (
         bull > bear
-        and bull >= MIN_SIGNAL_SCORE
-        and ema9 > ema21
-        and price > ema9
-        and structure in ("BULLISH", "NEUTRAL")
-        and plus_di > minus_di
-        and adx >= MIN_ADX_FOR_SIGNAL
-        and 50 <= current_rsi <= 72
+        and direction == "BULLISH"
     ):
-        return "BUY", 4
+
+        gap = bull - bear
+
+        if gap >= MIN_DIRECTION_GAP:
+
+            return "BUY"
+
 
     # --------------------------------------------------------
     # SELL
@@ -955,258 +1201,448 @@ def confirm_signal(
 
     if (
         bear > bull
-        and bear >= MIN_SIGNAL_SCORE
-        and ema9 < ema21
-        and price < ema9
-        and structure in ("BEARISH", "NEUTRAL")
-        and minus_di > plus_di
-        and adx >= MIN_ADX_FOR_SIGNAL
-        and 28 <= current_rsi <= 50
+        and direction == "BEARISH"
     ):
-        return "SELL", 4
 
-    return "HOLD", 0
+        gap = bear - bull
+
+        if gap >= MIN_DIRECTION_GAP:
+
+            return "SELL"
+
+
+    return "HOLD"
 
 
 # ============================================================
-# TP / SL
+# EXTREME WICK FILTER
 # ============================================================
 
-def calculate_dynamic_targets(
-    entry_price,
-    current_atr,
-    direction="SELL",
-):
-    """
-    اهداف کاملاً پویا بر اساس ATR همان کندل بسته‌شده.
-    """
-    multipliers = (1.0, 2.0, 3.0)
+def wick_rejection(signal, candle):
 
-    if direction.upper() == "SELL":
-        return [
-            round(entry_price - (m * current_atr), 2)
-            for m in multipliers
-        ]
+    data = candle_wick_data(candle)
 
-    return [
-        round(entry_price + (m * current_atr), 2)
-        for m in multipliers
-    ]
+    body = data["body"]
+
+    lower = data["lower"]
+    upper = data["upper"]
+
+    # If body is tiny, do not aggressively reject.
+    if body <= 0:
+
+        return False
 
 
-def calculate_levels(
-    signal,
-    price,
-    current_atr,
-    support,
-    resistance,
-):
-    targets = calculate_dynamic_targets(
-        price,
-        current_atr,
-        signal,
-    )
+    # --------------------------------------------------------
+    # BUY
+    #
+    # Extremely long upper wick can mean sellers rejected
+    # higher prices.
+    # --------------------------------------------------------
 
     if signal == "BUY":
-        return {
-            "entry": price,
-            "tp1": targets[0],
-            "tp2": targets[1],
-            "tp3": targets[2],
-            "sl": round(price - current_atr * SL_ATR, 2),
-            "support": support,
-            "resistance": resistance,
-        }
+
+        if upper > body * 2.5:
+
+            return True
+
+
+    # --------------------------------------------------------
+    # SELL
+    #
+    # Extremely long lower wick can mean buyers rejected
+    # lower prices.
+    # --------------------------------------------------------
 
     if signal == "SELL":
-        return {
-            "entry": price,
-            "tp1": targets[0],
-            "tp2": targets[1],
-            "tp3": targets[2],
-            "sl": round(price + current_atr * SL_ATR, 2),
-            "support": support,
-            "resistance": resistance,
-        }
 
-    return None
+        if lower > body * 2.5:
 
+            return True
 
-# ============================================================
-# REPEATED SIGNAL FILTER
-# ============================================================
-
-def repeated_signal_is_allowed(
-    signal,
-    price,
-    current_atr,
-    score,
-):
-
-    if last_sent_signal is None:
-        return True
-
-    # تغییر جهت همیشه اجازه دارد
-    if signal != last_sent_signal:
-        return True
-
-    if (
-        last_sent_price is None
-        or last_sent_score is None
-    ):
-        return True
-
-    price_move = abs(
-        price - last_sent_price
-    )
-
-    # اگر قیمت حداقل 0.6 ATR حرکت کرده باشد
-    if price_move >= current_atr * 0.60:
-        return True
-
-    # یا قدرت سیگنال حداقل 8 امتیاز بهتر شده باشد
-    if score >= last_sent_score + 8:
-        return True
 
     return False
 
 
 # ============================================================
-# TELEGRAM MESSAGE - PERSIAN
+# DYNAMIC TARGETS
+# ============================================================
+
+def calculate_dynamic_targets(
+    entry_price,
+    atr,
+    direction
+):
+
+    if direction == "BUY":
+
+        tp1 = (
+            entry_price
+            + atr * TP1_ATR
+        )
+
+        tp2 = (
+            entry_price
+            + atr * TP2_ATR
+        )
+
+        tp3 = (
+            entry_price
+            + atr * TP3_ATR
+        )
+
+        sl = (
+            entry_price
+            - atr * SL_ATR
+        )
+
+    else:
+
+        tp1 = (
+            entry_price
+            - atr * TP1_ATR
+        )
+
+        tp2 = (
+            entry_price
+            - atr * TP2_ATR
+        )
+
+        tp3 = (
+            entry_price
+            - atr * TP3_ATR
+        )
+
+        sl = (
+            entry_price
+            + atr * SL_ATR
+        )
+
+
+    return {
+
+        "entry": round(
+            entry_price,
+            2
+        ),
+
+        "tp1": round(
+            tp1,
+            2
+        ),
+
+        "tp2": round(
+            tp2,
+            2
+        ),
+
+        "tp3": round(
+            tp3,
+            2
+        ),
+
+        "sl": round(
+            sl,
+            2
+        )
+    }
+
+
+# ============================================================
+# SUPPORT / RESISTANCE
+# ============================================================
+
+def calculate_support_resistance(
+    candles,
+    count=20
+):
+
+    recent = candles[-count:]
+
+    support = min(
+        c["low"]
+        for c in recent
+    )
+
+    resistance = max(
+        c["high"]
+        for c in recent
+    )
+
+    return support, resistance
+
+
+# ============================================================
+# SIGNAL QUALITY
+# ============================================================
+
+def signal_quality(score, adx):
+
+    if (
+        score >= 80
+        and adx >= 25
+    ):
+
+        return "بسیار قوی"
+
+    if (
+        score >= 70
+        and adx >= 20
+    ):
+
+        return "قوی"
+
+    if score >= 60:
+
+        return "متوسط رو به قوی"
+
+    return "ضعیف"
+
+
+# ============================================================
+# PERSIAN TELEGRAM MESSAGE
 # ============================================================
 
 def build_message(
     signal,
     analysis,
     levels,
-    confirmation_count,
+    support,
+    resistance
 ):
 
     if signal == "BUY":
-        title = "🟢 سیگنال طلا — خرید"
+
+        title = "🟢 سیگنال خرید طلا"
+
+        direction_text = "خرید"
 
     else:
-        title = "🔴 سیگنال طلا — فروش"
 
-    if analysis["score"] >= 85:
-        quality = "بسیار قوی"
+        title = "🔴 سیگنال فروش طلا"
 
-    elif analysis["score"] >= 75:
-        quality = "قوی"
+        direction_text = "فروش"
 
-    else:
-        quality = "معتبر"
+
+    quality = signal_quality(
+        analysis["score"],
+        analysis["adx"]
+    )
+
+
+    adx_status = (
+        "روند قوی"
+        if analysis["adx"] >= 25
+        else
+        "روند متوسط"
+        if analysis["adx"] >= 20
+        else
+        "بازار کم‌قدرت / رنج"
+    )
+
 
     return f"""
 {title}
 
-🔹 نماد: XAU/USD
-⏱ تایم‌فریم: ۵ دقیقه
+━━━━━━━━━━━━━━━━
+
+📌 نماد: {SYMBOL}
+⏱ تایم‌فریم: {INTERVAL}
 
 💰 قیمت ورود: {levels["entry"]:.2f}
 
-📊 روند: {analysis["trend"]}
-⭐ امتیاز سیگنال: {analysis["score"]}/100
-🏆 کیفیت: {quality}
+📊 جهت: {direction_text}
+📈 روند: {analysis["trend"]}
 
-📈 EMA 9: {analysis["ema9"]:.2f}
-📉 EMA 21: {analysis["ema21"]:.2f}
-📊 RSI: {analysis["rsi"]:.2f}
-📏 ATR: {analysis["atr"]:.2f}
-💪 ADX: {analysis["adx"]:.2f}
-🟢 +DI: {analysis["plus_di"]:.2f}
-🔴 -DI: {analysis["minus_di"]:.2f}
+⭐ امتیاز سیگنال:
+{analysis["score"]}/100
 
-━━━━━━━━━━━━━━━━
+💪 قدرت روند ADX:
+{analysis["adx"]:.2f}
 
-🎯 هدف اول: {levels["tp1"]:.2f}
-🎯 هدف دوم: {levels["tp2"]:.2f}
-🎯 هدف سوم: {levels["tp3"]:.2f}
+📌 وضعیت روند:
+{adx_status}
 
-🛑 حد ضرر: {levels["sl"]:.2f}
++DI: {analysis["plus_di"]:.2f}
+-DI: {analysis["minus_di"]:.2f}
 
 ━━━━━━━━━━━━━━━━
 
-📉 حمایت: {levels["support"]:.2f}
-📈 مقاومت: {levels["resistance"]:.2f}
+📊 اندیکاتورها
 
-✅ تأیید: {confirmation_count}/4
-💪 ADX بالاتر از 25: روند قوی
-🔒 فقط بر اساس کندل بسته‌شده
+EMA 9:
+{analysis["ema9"]:.2f}
 
-⚠️ تحلیل تکنیکال است و فعلاً معامله خودکار فعال نیست.
-""".strip()
+EMA 21:
+{analysis["ema21"]:.2f}
+
+RSI:
+{analysis["rsi"]:.2f}
+
+ATR:
+{analysis["atr"]:.2f}
+
+━━━━━━━━━━━━━━━━
+
+🎯 اهداف پویا
+
+TP1:
+{levels["tp1"]:.2f}
+
+TP2:
+{levels["tp2"]:.2f}
+
+TP3:
+{levels["tp3"]:.2f}
+
+🛑 حد ضرر:
+{levels["sl"]:.2f}
+
+━━━━━━━━━━━━━━━━
+
+📉 حمایت:
+{support:.2f}
+
+📈 مقاومت:
+{resistance:.2f}
+
+⭐ کیفیت سیگنال:
+{quality}
+
+━━━━━━━━━━━━━━━━
+
+⚠️ این پیام تحلیل تکنیکال است.
+معامله خودکار فعال نیست.
+"""
 
 
 # ============================================================
-# ANALYZE
+# MAIN ANALYSIS
 # ============================================================
 
-def analyze(candles):
-    """
-    تحلیل فقط روی داده‌ای که در زمان‌بندی کنترل‌شده از Twelve Data گرفته شده.
-    """
+def analyze():
 
     global last_processed_candle
-    global last_sent_signal
     global last_sent_candle
-    global last_sent_price
-    global last_sent_score
+    global last_sent_signal
 
-    if len(candles) < 60:
+
+    # --------------------------------------------------------
+    # GET MARKET DATA
+    # --------------------------------------------------------
+
+    candles = get_candles(
+        outputsize=100
+    )
+
+    if len(candles) < 50:
+
         log.warning(
-            "کندل کافی دریافت نشد: %d",
-            len(candles),
+            "Not enough candles: %d",
+            len(candles)
         )
+
         return
 
-    closed = get_closed_candles(candles)
 
-    if len(closed) < 60:
+    # --------------------------------------------------------
+    # CLOSED CANDLES
+    # --------------------------------------------------------
+
+    closed = get_closed_candles(
+        candles
+    )
+
+    if len(closed) < 50:
+
         log.warning(
-            "کندل بسته‌شده کافی نیست: %d",
-            len(closed),
+            "Not enough CLOSED candles: %d",
+            len(closed)
         )
+
         return
+
 
     latest = closed[-1]
 
-    candle_id = latest["datetime"].isoformat()
+    candle_id = (
+        latest["datetime"].isoformat()
+    )
 
-    # یک تحلیل برای هر کندل بسته‌شده
+
+    # --------------------------------------------------------
+    # DUPLICATE CANDLE
+    # --------------------------------------------------------
+
     if candle_id == last_processed_candle:
-        log.info("این کندل قبلاً تحلیل شده است.")
+
         return
 
-    age = candle_age_minutes(latest)
+
+    age = candle_age_minutes(
+        latest
+    )
 
     log.info(
-        "New closed 5m candle | age=%.2f min | candle=%s",
-        age,
+        "New closed 5m candle: %s | age=%.2f min",
         candle_id,
+        age
     )
+
+
+    # --------------------------------------------------------
+    # STALE CANDLE
+    # --------------------------------------------------------
 
     if age > MAX_CANDLE_AGE_MINUTES:
-        log.warning("کندل قدیمی رد شد.")
+
+        log.warning(
+            "Candle rejected as stale."
+        )
+
         last_processed_candle = candle_id
+
         return
 
-    analysis = calculate_analysis(closed)
+
+    # --------------------------------------------------------
+    # CALCULATE INDICATORS
+    # --------------------------------------------------------
+
+    analysis = calculate_analysis(
+        closed
+    )
 
     if not analysis:
-        log.warning("محاسبه اندیکاتورها ناموفق بود.")
-        last_processed_candle = candle_id
+
+        log.warning(
+            "Indicator calculation failed."
+        )
+
         return
 
-    recent = closed[-30:]
 
-    support = min(c["low"] for c in recent)
-    resistance = max(c["high"] for c in recent)
+    # --------------------------------------------------------
+    # SUPPORT / RESISTANCE
+    # --------------------------------------------------------
 
-    signal, confirmation_count = confirm_signal(
-        closed,
-        analysis,
+    support, resistance = (
+        calculate_support_resistance(
+            closed,
+            20
+        )
     )
+
+
+    # --------------------------------------------------------
+    # SIGNAL
+    # --------------------------------------------------------
+
+    signal = confirm_signal(
+        closed,
+        analysis
+    )
+
 
     log.info(
         "Price=%.2f | EMA9=%.2f | EMA21=%.2f | RSI=%.2f | ATR=%.2f",
@@ -1214,125 +1650,148 @@ def analyze(candles):
         analysis["ema9"],
         analysis["ema21"],
         analysis["rsi"],
-        analysis["atr"],
+        analysis["atr"]
     )
 
+
     log.info(
-        "Bull=%d | Bear=%d | Score=%d | Trend=%s | Structure=%s | "
-        "ADX=%.2f | +DI=%.2f | -DI=%.2f | Signal=%s",
+        "Bull=%d | Bear=%d | Trend=%s | Score=%d | ADX=%.2f | +DI=%.2f | -DI=%.2f | Signal=%s",
         analysis["bull"],
         analysis["bear"],
-        analysis["score"],
         analysis["trend"],
-        analysis["structure"],
+        analysis["score"],
         analysis["adx"],
         analysis["plus_di"],
         analysis["minus_di"],
-        signal,
+        signal
     )
 
-    # این کندل بررسی شد؛ از تحلیل مجدد آن جلوگیری می‌کنیم.
-    last_processed_candle = candle_id
+
+    # --------------------------------------------------------
+    # HOLD
+    # --------------------------------------------------------
 
     if signal == "HOLD":
-        log.info("شرایط سیگنال قوی وجود ندارد؛ پیام ارسال نشد.")
+
+        log.info(
+            "No actionable signal on this candle."
+        )
+
+        last_processed_candle = candle_id
+
         return
 
-    if not repeated_signal_is_allowed(
-        signal,
-        analysis["price"],
-        analysis["atr"],
-        analysis["score"],
-    ):
-        log.info("سیگنال تکراری و نزدیک به سیگنال قبلی حذف شد.")
+
+    # --------------------------------------------------------
+    # SCORE FILTER
+    # --------------------------------------------------------
+
+    if analysis["score"] < MIN_SIGNAL_SCORE:
+
+        log.info(
+            "Signal rejected by score: %d < %d",
+            analysis["score"],
+            MIN_SIGNAL_SCORE
+        )
+
+        last_processed_candle = candle_id
+
         return
 
-    levels = calculate_levels(
-        signal,
-        analysis["price"],
-        analysis["atr"],
-        support,
-        resistance,
+
+    # --------------------------------------------------------
+    # DIRECTION GAP
+    # --------------------------------------------------------
+
+    gap = abs(
+        analysis["bull"]
+        - analysis["bear"]
     )
 
-    if not levels:
+    if gap < MIN_DIRECTION_GAP:
+
+        log.info(
+            "Signal rejected by direction gap: %d < %d",
+            gap,
+            MIN_DIRECTION_GAP
+        )
+
+        last_processed_candle = candle_id
+
         return
+
+
+    # --------------------------------------------------------
+    # EXTREME WICK
+    # --------------------------------------------------------
+
+    if wick_rejection(
+        signal,
+        latest
+    ):
+
+        log.info(
+            "Signal rejected by extreme wick filter."
+        )
+
+        last_processed_candle = candle_id
+
+        return
+
+
+    # --------------------------------------------------------
+    # DYNAMIC TARGETS
+    # --------------------------------------------------------
+
+    levels = calculate_dynamic_targets(
+        analysis["price"],
+        analysis["atr"],
+        signal
+    )
+
+
+    # --------------------------------------------------------
+    # BUILD MESSAGE
+    # --------------------------------------------------------
 
     message = build_message(
         signal,
         analysis,
         levels,
-        confirmation_count,
+        support,
+        resistance
     )
 
-    if send_telegram(message):
+
+    # --------------------------------------------------------
+    # SEND TELEGRAM
+    # --------------------------------------------------------
+
+    success = send_telegram(
+        message
+    )
+
+
+    if success:
+
         last_sent_signal = signal
         last_sent_candle = candle_id
-        last_sent_price = analysis["price"]
-        last_sent_score = analysis["score"]
+        last_processed_candle = candle_id
 
         log.info(
-            "Signal delivered | %s | price=%.2f | score=%d",
+            "SIGNAL SENT SUCCESSFULLY | %s | candle=%s",
             signal,
-            analysis["price"],
-            analysis["score"],
+            candle_id
         )
 
+    else:
 
-def seconds_until_next_fetch():
-    """
-    فقط یک درخواست برای هر کندل 5 دقیقه‌ای.
-    درخواست 75 ثانیه بعد از بسته‌شدن کندل انجام می‌شود تا
-    تأخیر پردازش داده Twelve Data را در نظر بگیریم.
-    """
-    now = time.time()
-
-    # زمان فعلی را روی بازه‌های 5 دقیقه‌ای می‌بریم.
-    current_bucket = int(now // CANDLE_SECONDS)
-
-    next_close = (current_bucket + 1) * CANDLE_SECONDS
-    target = next_close + FETCH_DELAY_AFTER_CLOSE_SECONDS
-
-    wait = target - now
-
-    if wait <= 0:
-        wait = CANDLE_SECONDS
-
-    return wait
-
-
-def fetch_and_analyze_once():
-    """
-    یک درخواست داده -> یک تحلیل.
-    در صورت 429 یا خطای API، تا نوبت بعدی درخواست صبر می‌کنیم
-    تا مصرف API بیشتر نشود.
-    """
-    global consecutive_api_failures
-
-    candles = get_candles()
-
-    if not candles:
-        consecutive_api_failures += 1
-
-        log.warning(
-            "دریافت داده ناموفق بود | failure=%d/%d",
-            consecutive_api_failures,
-            MAX_CONSECUTIVE_API_FAILURES,
+        log.error(
+            "SIGNAL WAS NOT SENT TO TELEGRAM."
         )
 
-        if consecutive_api_failures >= MAX_CONSECUTIVE_API_FAILURES:
-            log.warning(
-                "چند درخواست متوالی ناموفق بود. "
-                "ربات تا نوبت بعدی API صبر می‌کند."
-            )
-
-        return False
-
-    consecutive_api_failures = 0
-
-    analyze(candles)
-
-    return True
+        # We do not mark the candle as processed.
+        # It can retry on the next scan.
 
 
 # ============================================================
@@ -1346,7 +1805,7 @@ def startup():
     )
 
     log.info(
-        "GOLD SIGNAL BOT - STRONG SIGNAL MODE"
+        "GOLD SIGNAL BOT v3 STARTED"
     )
 
     log.info(
@@ -1355,31 +1814,39 @@ def startup():
 
     log.info(
         "Symbol: %s",
-        SYMBOL,
+        SYMBOL
     )
 
     log.info(
         "Timeframe: %s",
-        INTERVAL,
+        INTERVAL
+    )
+
+    log.info(
+        "Scan interval: %d seconds",
+        CHECK_SECONDS
     )
 
     log.info(
         "Minimum Signal Score: %d/100",
-        MIN_SIGNAL_SCORE,
+        MIN_SIGNAL_SCORE
     )
 
     log.info(
-        "Minimum Score Margin: %d",
-        MIN_SCORE_MARGIN,
+        "Minimum Direction Gap: %d",
+        MIN_DIRECTION_GAP
     )
 
     log.info(
-        "API Schedule: 1 request per 5-minute candle",
+        "ADX: ON"
     )
 
     log.info(
-        "Fetch Delay After Candle Close: %d seconds",
-        FETCH_DELAY_AFTER_CLOSE_SECONDS,
+        "Dynamic ATR Targets: ON"
+    )
+
+    log.info(
+        "Dynamic Stop Loss: ON"
     )
 
     log.info(
@@ -1387,31 +1854,11 @@ def startup():
     )
 
     log.info(
-        "Strong Structure Confirmation: ON"
+        "Extreme Wick Protection: ON"
     )
 
     log.info(
-        "Repeated Signal Filter: ON"
-    )
-
-    log.info(
-        "Twelve Data API Protection: ON"
-    )
-    log.info(
-        "One API request per 5-minute candle: ON"
-    )
-    log.info(
-        "ADX Filter: >= %.1f",
-        MIN_ADX_FOR_SIGNAL,
-    )
-    log.info(
-        "Directional DI Filter: ON"
-    )
-    log.info(
-        "Long Opposite-Wick Filter: ON"
-    )
-    log.info(
-        "Dynamic ATR Targets: 1x / 2x / 3x",
+        "Duplicate Candle Protection: ON"
     )
 
     log.info(
@@ -1419,11 +1866,11 @@ def startup():
     )
 
     log.info(
-        "Automatic Trading: DISABLED"
+        "Automatic Trading: OFF"
     )
 
     log.info(
-        "Telegram timestamps: OFF"
+        "Telegram language: Persian"
     )
 
     log.info(
@@ -1436,55 +1883,39 @@ def startup():
 # ============================================================
 
 def main():
-    global next_fetch_time
 
     startup()
 
-    # یک بار در شروع اجرا داده می‌گیریم.
-    log.info("Initial market-data request...")
-    fetch_and_analyze_once()
-
-    # درخواست بعدی دقیقاً طبق چرخه 5 دقیقه‌ای برنامه‌ریزی می‌شود.
-    next_fetch_time = time.time() + seconds_until_next_fetch()
-
     while True:
+
         try:
-            now = time.time()
 
-            if now >= next_fetch_time:
-                log.info("Scheduled 5-minute market-data request...")
-                fetch_and_analyze_once()
-
-                # بعد از هر درخواست، نوبت بعدی دوباره محاسبه می‌شود.
-                next_fetch_time = (
-                    time.time() + seconds_until_next_fetch()
-                )
-
-            else:
-                # خواب کوتاه فقط برای مدیریت زمان‌بندی محلی است؛
-                # هیچ درخواست API در این فاصله ارسال نمی‌شود.
-                sleep_for = min(
-                    5.0,
-                    max(0.5, next_fetch_time - now),
-                )
-                time.sleep(sleep_for)
+            analyze()
 
         except KeyboardInterrupt:
-            log.info("Bot stopped.")
+
+            log.info(
+                "Bot stopped manually."
+            )
+
             break
 
-        except Exception as exc:
+        except Exception as e:
+
             log.exception(
                 "Unexpected error: %s",
-                exc,
+                e
             )
 
-            # در صورت خطای غیرمنتظره نیز از درخواست‌های پشت‌سرهم جلوگیری می‌کنیم.
-            next_fetch_time = (
-                time.time()
-                + seconds_until_next_fetch()
-            )
+        time.sleep(
+            CHECK_SECONDS
+        )
 
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
+
     main()
