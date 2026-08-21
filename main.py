@@ -7,31 +7,31 @@ import requests
 
 
 # ============================================================
-# GOLD SIGNAL BOT - PROFESSIONAL v3
+# GOLD SIGNAL BOT
+# PROFESSIONAL ANALYSIS + TUX EMA SCALPER FILTER
 # ============================================================
-# XAU/USD - 5 Minute
 #
-# Indicators:
-# EMA 9 / EMA 21
-# RSI 14
-# ATR 14
-# ADX 14
-# +DI / -DI
+# Symbol: XAU/USD
+# Timeframe: 5min
 #
-# Features:
-# - Closed candle protection
-# - Dynamic ATR targets
-# - Dynamic Stop Loss
-# - Controlled signal scoring
-# - ADX as trend-strength filter, NOT a hard blocker
-# - Candle confirmation
-# - Extreme wick protection
-# - Duplicate candle protection
-# - Telegram Persian messages
-# - Telegram error diagnostics
-# - Automatic trading OFF
-# - HOLD messages OFF
-# - Reduced API requests to avoid rate limiting
+# Main filters:
+#   EMA 9 / EMA 21
+#   RSI 14
+#   ADX 14
+#   TUX EMA Scalper style filter
+#
+# TUX FILTER:
+#   Length = 12
+#   Source = HLC3
+#
+# Dynamic targets:
+#   TP1 = 1 ATR
+#   TP2 = 2 ATR
+#   TP3 = 3 ATR
+#   SL  = 1.5 ATR
+#
+# Automatic trading: OFF
+# HOLD messages: OFF
 # ============================================================
 
 
@@ -47,38 +47,55 @@ API_KEY = os.getenv("API_KEY")
 SYMBOL = "XAU/USD"
 INTERVAL = "5min"
 
+# Check every 30 seconds, but analyze only once per closed candle
+CHECK_SECONDS = 30
 
-# IMPORTANT:
-# Do not check Twelve Data every 30 seconds.
-# It can cause "Many Requests".
-CHECK_SECONDS = 300
+# Minimum final trend score
+MIN_TREND_SCORE = 55
 
-
-# Minimum total score required
-MIN_SIGNAL_SCORE = 60
-
-
-# Minimum difference between BUY and SELL scores
-MIN_DIRECTION_GAP = 5
-
-
-# Maximum acceptable age of the latest closed candle
+# Reject very old candles
 MAX_CANDLE_AGE_MINUTES = 8
 
 
-# ATR targets
+# ============================================================
+# INDICATOR SETTINGS
+# ============================================================
+
+EMA_FAST = 9
+EMA_SLOW = 21
+
+RSI_PERIOD = 14
+ADX_PERIOD = 14
+ATR_PERIOD = 14
+
+
+# ============================================================
+# TUX EMA SCALPER FILTER
+# ============================================================
+
+TUX_LENGTH = 12
+TUX_SOURCE = "HLC3"
+
+# Previous close lookback used as support/resistance reference
+TUX_LOOKBACK = 8
+
+
+# ============================================================
+# ATR TARGET SETTINGS
+# ============================================================
+
 TP1_ATR = 1.0
 TP2_ATR = 2.0
 TP3_ATR = 3.0
 
-# Stop Loss
 SL_ATR = 1.5
 
 
-# Automatic trading remains OFF
-AUTOMATIC_TRADING = False
+# ============================================================
+# TRADING MODE
+# ============================================================
 
-# Do not send HOLD messages
+AUTOMATIC_TRADING = False
 SEND_HOLD_MESSAGES = False
 
 
@@ -95,7 +112,7 @@ log = logging.getLogger("GoldSignalBot")
 
 
 # ============================================================
-# ENVIRONMENT CHECK
+# ENVIRONMENT VALIDATION
 # ============================================================
 
 if not BOT_TOKEN:
@@ -115,7 +132,7 @@ if not API_KEY:
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "GoldSignalBot/3.0"
+    "User-Agent": "GoldSignalBot/Professional-TUX"
 })
 
 
@@ -124,8 +141,8 @@ session.headers.update({
 # ============================================================
 
 last_processed_candle = None
-last_sent_candle = None
 last_sent_signal = None
+last_sent_candle = None
 
 
 # ============================================================
@@ -152,39 +169,22 @@ def send_telegram(message):
         data = response.json()
 
         if not data.get("ok"):
-
-            log.error(
-                "Telegram API rejected message: %s",
-                data
-            )
-
+            log.error("Telegram error: %s", data)
             return False
 
         log.info("Telegram message sent successfully.")
 
         return True
 
-    except requests.exceptions.RequestException as e:
-
-        log.error(
-            "Telegram connection error: %s",
-            e
-        )
-
-        return False
-
     except Exception as e:
 
-        log.exception(
-            "Telegram unexpected error: %s",
-            e
-        )
+        log.error("Telegram error: %s", e)
 
         return False
 
 
 # ============================================================
-# DATE PARSER
+# DATETIME
 # ============================================================
 
 def parse_utc(value):
@@ -203,14 +203,14 @@ def parse_utc(value):
 
     except Exception:
 
-        return None
+        raise ValueError(f"Invalid datetime: {value}")
 
 
 # ============================================================
 # MARKET DATA
 # ============================================================
 
-def get_candles(outputsize=100):
+def get_candles(outputsize=150):
 
     url = "https://api.twelvedata.com/time_series"
 
@@ -235,7 +235,6 @@ def get_candles(outputsize=100):
 
         data = response.json()
 
-        # Twelve Data error
         if data.get("status") == "error":
 
             log.error(
@@ -245,25 +244,7 @@ def get_candles(outputsize=100):
 
             return []
 
-        # Rate limit / API message
-        if "message" in data and "values" not in data:
-
-            log.error(
-                "Twelve Data message: %s",
-                data.get("message")
-            )
-
-            return []
-
         values = data.get("values", [])
-
-        if not values:
-
-            log.warning(
-                "Twelve Data returned zero candles."
-            )
-
-            return []
 
         result = []
 
@@ -271,16 +252,11 @@ def get_candles(outputsize=100):
 
             try:
 
-                dt = parse_utc(
-                    item["datetime"]
-                )
-
-                if dt is None:
-                    continue
-
                 result.append({
 
-                    "datetime": dt,
+                    "datetime": parse_utc(
+                        item["datetime"]
+                    ),
 
                     "open": float(
                         item["open"]
@@ -297,6 +273,7 @@ def get_candles(outputsize=100):
                     "close": float(
                         item["close"]
                     )
+
                 })
 
             except (
@@ -311,26 +288,12 @@ def get_candles(outputsize=100):
             key=lambda x: x["datetime"]
         )
 
-        log.info(
-            "Market data received: %d candles",
-            len(result)
-        )
-
         return result
-
-    except requests.exceptions.RequestException as e:
-
-        log.error(
-            "Market data request failed: %s",
-            e
-        )
-
-        return []
 
     except Exception as e:
 
-        log.exception(
-            "Market data unexpected error: %s",
+        log.error(
+            "Market data error: %s",
             e
         )
 
@@ -349,7 +312,8 @@ def get_closed_candles(candles):
 
     for candle in candles:
 
-        # 5 minute candle
+        # 5-minute candle
+        # datetime = candle OPEN time
         close_time = (
             candle["datetime"].timestamp()
             + 300
@@ -378,7 +342,7 @@ def candle_age_minutes(candle):
     age = (
         now.timestamp()
         - close_time
-    ) / 60
+    ) / 60.0
 
     return max(0.0, age)
 
@@ -395,26 +359,26 @@ def ema_series(values, period):
 
     multiplier = 2 / (period + 1)
 
-    initial = sum(
+    ema_value = sum(
         values[:period]
     ) / period
 
     result = (
         [None] * (period - 1)
-        + [initial]
+        + [ema_value]
     )
 
-    value = initial
+    for value in values[period:]:
 
-    for price in values[period:]:
-
-        value = (
-            (price - value)
+        ema_value = (
+            (value - ema_value)
             * multiplier
-            + value
+            + ema_value
         )
 
-        result.append(value)
+        result.append(
+            ema_value
+        )
 
     return result
 
@@ -423,10 +387,9 @@ def ema_series(values, period):
 # RSI
 # ============================================================
 
-def calculate_rsi(values, period=14):
+def rsi(values, period=14):
 
     if len(values) < period + 1:
-
         return None
 
     gains = []
@@ -493,7 +456,7 @@ def calculate_rsi(values, period=14):
 # ATR
 # ============================================================
 
-def calculate_atr(candles, period=14):
+def atr(candles, period=14):
 
     if len(candles) < period + 1:
 
@@ -508,32 +471,21 @@ def calculate_atr(candles, period=14):
 
         high = candles[i]["high"]
         low = candles[i]["low"]
-
         previous_close = (
             candles[i - 1]["close"]
         )
 
         tr = max(
-
             high - low,
-
-            abs(
-                high
-                - previous_close
-            ),
-
-            abs(
-                low
-                - previous_close
-            )
+            abs(high - previous_close),
+            abs(low - previous_close)
         )
 
         true_ranges.append(tr)
 
     atr_value = (
-        sum(
-            true_ranges[:period]
-        ) / period
+        sum(true_ranges[:period])
+        / period
     )
 
     for tr in true_ranges[period:]:
@@ -550,10 +502,152 @@ def calculate_atr(candles, period=14):
 
 
 # ============================================================
-# ADX / DI
+# HLC3
 # ============================================================
 
-def calculate_adx(candles, period=14):
+def hlc3(candle):
+
+    return (
+        candle["high"]
+        + candle["low"]
+        + candle["close"]
+    ) / 3.0
+
+
+def hlc3_series(candles):
+
+    return [
+        hlc3(c)
+        for c in candles
+    ]
+
+
+# ============================================================
+# TUX EMA SCALPER
+# ============================================================
+
+def tux_ema_series(candles):
+
+    source = hlc3_series(candles)
+
+    return ema_series(
+        source,
+        TUX_LENGTH
+    )
+
+
+def tux_filter(candles):
+
+    if len(candles) < TUX_LENGTH + 3:
+
+        return {
+            "signal": "NONE",
+            "ema": None,
+            "source": None,
+            "previous_source": None,
+            "previous_ema": None,
+            "cross_up": False,
+            "cross_down": False,
+            "uptrend": False,
+            "downtrend": False
+        }
+
+    tux_ema = tux_ema_series(candles)
+
+    if len(tux_ema) < 3:
+
+        return {
+            "signal": "NONE",
+            "ema": None,
+            "source": None,
+            "previous_source": None,
+            "previous_ema": None,
+            "cross_up": False,
+            "cross_down": False,
+            "uptrend": False,
+            "downtrend": False
+        }
+
+    source_now = hlc3(candles[-1])
+    source_prev = hlc3(candles[-2])
+
+    ema_now = tux_ema[-1]
+    ema_prev = tux_ema[-2]
+
+    if ema_now is None or ema_prev is None:
+
+        return {
+            "signal": "NONE",
+            "ema": None,
+            "source": source_now,
+            "previous_source": source_prev,
+            "previous_ema": ema_prev,
+            "cross_up": False,
+            "cross_down": False,
+            "uptrend": False,
+            "downtrend": False
+        }
+
+    cross_up = (
+        source_prev <= ema_prev
+        and source_now > ema_now
+    )
+
+    cross_down = (
+        source_prev >= ema_prev
+        and source_now < ema_now
+    )
+
+    uptrend = source_now > ema_now
+    downtrend = source_now < ema_now
+
+    if cross_up and uptrend:
+
+        signal = "BUY"
+
+    elif cross_down and downtrend:
+
+        signal = "SELL"
+
+    elif uptrend:
+
+        signal = "BUY_BIAS"
+
+    elif downtrend:
+
+        signal = "SELL_BIAS"
+
+    else:
+
+        signal = "NEUTRAL"
+
+    return {
+
+        "signal": signal,
+
+        "ema": ema_now,
+
+        "source": source_now,
+
+        "previous_source": source_prev,
+
+        "previous_ema": ema_prev,
+
+        "cross_up": cross_up,
+
+        "cross_down": cross_down,
+
+        "uptrend": uptrend,
+
+        "downtrend": downtrend
+    }
+
+
+# ============================================================
+# ADX
+# ============================================================
+
+def adx(candles, period=14):
 
     if len(candles) < (
         period * 2 + 1
@@ -573,79 +667,72 @@ def calculate_adx(candles, period=14):
         current = candles[i]
         previous = candles[i - 1]
 
-        high = current["high"]
-        low = current["low"]
+        high_diff = (
+            current["high"]
+            - previous["high"]
+        )
 
-        previous_high = previous["high"]
-        previous_low = previous["low"]
-        previous_close = previous["close"]
+        low_diff = (
+            previous["low"]
+            - current["low"]
+        )
+
+        if (
+            high_diff > low_diff
+            and high_diff > 0
+        ):
+
+            pdm = high_diff
+
+        else:
+
+            pdm = 0.0
+
+        if (
+            low_diff > high_diff
+            and low_diff > 0
+        ):
+
+            mdm = low_diff
+
+        else:
+
+            mdm = 0.0
 
         tr = max(
 
-            high - low,
+            current["high"]
+            - current["low"],
 
             abs(
-                high
-                - previous_close
+                current["high"]
+                - previous["close"]
             ),
 
             abs(
-                low
-                - previous_close
+                current["low"]
+                - previous["close"]
             )
         )
 
-        up_move = (
-            high - previous_high
-        )
-
-        down_move = (
-            previous_low - low
-        )
-
-        if (
-            up_move > down_move
-            and up_move > 0
-        ):
-
-            p_dm = up_move
-
-        else:
-
-            p_dm = 0.0
-
-        if (
-            down_move > up_move
-            and down_move > 0
-        ):
-
-            m_dm = down_move
-
-        else:
-
-            m_dm = 0.0
-
         tr_values.append(tr)
-        plus_dm.append(p_dm)
-        minus_dm.append(m_dm)
+        plus_dm.append(pdm)
+        minus_dm.append(mdm)
 
     if len(tr_values) < period:
 
         return None
 
-    atr_smoothed = (
-        sum(tr_values[:period])
-        / period
+    atr_value = sum(
+        tr_values[:period]
     )
 
-    plus_smoothed = (
-        sum(plus_dm[:period])
-        / period
+    plus_value = sum(
+        plus_dm[:period]
     )
 
-    minus_smoothed = (
-        sum(minus_dm[:period])
-        / period
+    minus_value = sum(
+        minus_dm[:period]
     )
 
     dx_values = []
@@ -655,48 +742,39 @@ def calculate_adx(candles, period=14):
         len(tr_values)
     ):
 
-        atr_smoothed = (
-            (
-                atr_smoothed
-                * (period - 1)
-            )
+        atr_value = (
+            atr_value
+            - (atr_value / period)
             + tr_values[i]
-        ) / period
+        )
 
-        plus_smoothed = (
-            (
-                plus_smoothed
-                * (period - 1)
-            )
+        plus_value = (
+            plus_value
+            - (plus_value / period)
             + plus_dm[i]
-        ) / period
+        )
 
-        minus_smoothed = (
-            (
-                minus_smoothed
-                * (period - 1)
-            )
+        minus_value = (
+            minus_value
+            - (minus_value / period)
             + minus_dm[i]
-        ) / period
+        )
 
-        if atr_smoothed == 0:
+        if atr_value == 0:
 
-            plus_di = 0
-            minus_di = 0
+            continue
 
-        else:
+        plus_di = (
+            100
+            * plus_value
+            / atr_value
+        )
 
-            plus_di = (
-                100
-                * plus_smoothed
-                / atr_smoothed
-            )
-
-            minus_di = (
-                100
-                * minus_smoothed
-                / atr_smoothed
-            )
+        minus_di = (
+            100
+            * minus_value
+            / atr_value
+        )
 
         denominator = (
             plus_di
@@ -705,7 +783,7 @@ def calculate_adx(candles, period=14):
 
         if denominator == 0:
 
-            dx = 0
+            dx = 0.0
 
         else:
 
@@ -730,61 +808,75 @@ def calculate_adx(candles, period=14):
 
         return None
 
-    adx = sum(
+    adx_value = sum(
         x[0]
         for x in dx_values[:period]
     ) / period
 
-    latest_plus_di = dx_values[-1][1]
-    latest_minus_di = dx_values[-1][2]
+    last_plus_di = None
+    last_minus_di = None
 
-    for i in range(
-        period,
-        len(dx_values)
-    ):
+    for dx, pdi, mdi in dx_values[period:]:
 
-        adx = (
+        adx_value = (
             (
-                adx
+                adx_value
                 * (period - 1)
             )
-            + dx_values[i][0]
+            + dx
         ) / period
 
+        last_plus_di = pdi
+        last_minus_di = mdi
+
+    if last_plus_di is None:
+
+        last_plus_di = dx_values[-1][1]
+        last_minus_di = dx_values[-1][2]
+
     return {
-        "adx": adx,
-        "plus_di": latest_plus_di,
-        "minus_di": latest_minus_di
+        "adx": adx_value,
+        "plus_di": last_plus_di,
+        "minus_di": last_minus_di
     }
 
 
 # ============================================================
-# CANDLE INFORMATION
+# CANDLE DIRECTION
 # ============================================================
 
 def candle_direction(candle):
 
     if candle["close"] > candle["open"]:
+
         return "BULLISH"
 
     if candle["close"] < candle["open"]:
+
         return "BEARISH"
 
     return "NEUTRAL"
 
 
 # ============================================================
-# WICK ANALYSIS
+# CANDLE SHADOW FILTER
 # ============================================================
 
-def candle_wick_data(candle):
+def candle_has_bad_shadow(
+    candle,
+    direction
+):
 
     body = abs(
         candle["close"]
         - candle["open"]
     )
 
-    upper_wick = (
+    if body <= 0:
+
+        return False
+
+    upper_shadow = (
         candle["high"]
         - max(
             candle["open"],
@@ -792,7 +884,7 @@ def candle_wick_data(candle):
         )
     )
 
-    lower_wick = (
+    lower_shadow = (
         min(
             candle["open"],
             candle["close"]
@@ -800,26 +892,27 @@ def candle_wick_data(candle):
         - candle["low"]
     )
 
-    total_range = (
-        candle["high"]
-        - candle["low"]
-    )
+    # For BUY:
+    # Long upper shadow can indicate
+    # rejection at the top.
 
-    if total_range <= 0:
+    if direction == "BUY":
 
-        return {
-            "body": 0,
-            "upper": 0,
-            "lower": 0,
-            "range": 0
-        }
+        if upper_shadow > body * 1.5:
 
-    return {
-        "body": body,
-        "upper": upper_wick,
-        "lower": lower_wick,
-        "range": total_range
-    }
+            return True
+
+    # For SELL:
+    # Long lower shadow can indicate
+    # buyers entering at the bottom.
+
+    if direction == "SELL":
+
+        if lower_shadow > body * 1.5:
+
+            return True
+
+    return False
 
 
 # ============================================================
@@ -828,10 +921,6 @@ def candle_wick_data(candle):
 
 def calculate_analysis(candles):
 
-    if len(candles) < 50:
-
-        return None
-
     closes = [
         c["close"]
         for c in candles
@@ -839,12 +928,12 @@ def calculate_analysis(candles):
 
     ema9_series = ema_series(
         closes,
-        9
+        EMA_FAST
     )
 
     ema21_series = ema_series(
         closes,
-        21
+        EMA_SLOW
     )
 
     if (
@@ -857,50 +946,49 @@ def calculate_analysis(candles):
     ema9 = ema9_series[-1]
     ema21 = ema21_series[-1]
 
-    previous_ema9 = (
-        ema9_series[-2]
-    )
-
-    previous_ema21 = (
-        ema21_series[-2]
-    )
+    previous_ema9 = ema9_series[-2]
+    previous_ema21 = ema21_series[-2]
 
     price = closes[-1]
 
-    rsi = calculate_rsi(
+    rsi_value = rsi(
         closes,
-        14
+        RSI_PERIOD
     )
 
-    atr = calculate_atr(
+    atr_value = atr(
         candles,
-        14
+        ATR_PERIOD
     )
 
-    adx_data = calculate_adx(
+    adx_data = adx(
         candles,
-        14
+        ADX_PERIOD
+    )
+
+    tux_data = tux_filter(
+        candles
     )
 
     if (
-        rsi is None
-        or atr is None
+        rsi_value is None
+        or atr_value is None
         or adx_data is None
+        or tux_data["ema"] is None
     ):
 
         return None
 
-    adx = adx_data["adx"]
-    plus_di = adx_data["plus_di"]
-    minus_di = adx_data["minus_di"]
+
+    # ========================================================
+    # SCORE
+    # ========================================================
 
     bull = 0
     bear = 0
 
-    # --------------------------------------------------------
-    # EMA TREND
-    # --------------------------------------------------------
 
+    # EMA 9 / EMA 21
     if ema9 > ema21:
 
         bull += 20
@@ -910,23 +998,17 @@ def calculate_analysis(candles):
         bear += 20
 
 
-    # --------------------------------------------------------
-    # PRICE POSITION
-    # --------------------------------------------------------
-
+    # Price vs EMA9
     if price > ema9:
 
-        bull += 15
+        bull += 10
 
     elif price < ema9:
 
-        bear += 15
+        bear += 10
 
 
-    # --------------------------------------------------------
-    # EMA MOMENTUM
-    # --------------------------------------------------------
-
+    # EMA9 momentum
     if ema9 > previous_ema9:
 
         bull += 10
@@ -936,65 +1018,44 @@ def calculate_analysis(candles):
         bear += 10
 
 
+    # EMA21 momentum
     if ema21 > previous_ema21:
 
-        bull += 5
+        bull += 10
 
     elif ema21 < previous_ema21:
 
-        bear += 5
+        bear += 10
 
 
-    # --------------------------------------------------------
     # RSI
-    # --------------------------------------------------------
-
-    if 52 <= rsi <= 68:
+    if 50 <= rsi_value <= 68:
 
         bull += 15
 
-    elif 32 <= rsi <= 48:
+    elif 32 <= rsi_value < 50:
 
         bear += 15
 
-    elif 48 < rsi < 52:
 
-        # Neutral RSI
-        pass
+    # Avoid extreme RSI
+    if rsi_value > 72:
 
-    # Extreme RSI is not automatically a reversal
-    # but reduces confidence.
+        bull -= 10
 
-    if rsi >= 75:
+    if rsi_value < 28:
 
-        bull -= 5
-
-    if rsi <= 25:
-
-        bear -= 5
+        bear -= 10
 
 
-    # --------------------------------------------------------
-    # ADX
-    # --------------------------------------------------------
-    # ADX measures strength, not direction.
-    #
-    # ADX >= 25:
-    # strong trend
-    #
-    # ADX 20-25:
-    # moderate trend
-    #
-    # ADX < 20:
-    # ranging market
-    #
-    # IMPORTANT:
-    # ADX < 20 DOES NOT completely block the signal.
-    # It only reduces confidence.
-    # This prevents the bot from becoming silent.
-    # --------------------------------------------------------
+    # ADX strength
+    adx_value = adx_data["adx"]
 
-    if adx >= 25:
+    plus_di = adx_data["plus_di"]
+    minus_di = adx_data["minus_di"]
+
+
+    if adx_value >= 25:
 
         if plus_di > minus_di:
 
@@ -1004,7 +1065,7 @@ def calculate_analysis(candles):
 
             bear += 15
 
-    elif adx >= 20:
+    elif adx_value >= 20:
 
         if plus_di > minus_di:
 
@@ -1014,74 +1075,42 @@ def calculate_analysis(candles):
 
             bear += 8
 
-    else:
 
-        # Weak trend / range
-        # Small directional contribution only
+    # TUX FILTER
+    #
+    # Cross = stronger confirmation
+    # Bias = weaker confirmation
 
-        if plus_di > minus_di:
+    if tux_data["cross_up"]:
 
-            bull += 3
+        bull += 15
 
-        elif minus_di > plus_di:
+    elif tux_data["cross_down"]:
 
-            bear += 3
+        bear += 15
+
+    elif tux_data["uptrend"]:
+
+        bull += 7
+
+    elif tux_data["downtrend"]:
+
+        bear += 7
 
 
-    # --------------------------------------------------------
-    # DI DIRECTION
-    # --------------------------------------------------------
+    # Latest candle
+    latest_direction = candle_direction(
+        candles[-1]
+    )
 
-    if plus_di > minus_di:
+    if latest_direction == "BULLISH":
 
         bull += 5
 
-    elif minus_di > plus_di:
+    elif latest_direction == "BEARISH":
 
         bear += 5
 
-
-    # --------------------------------------------------------
-    # LATEST CANDLE
-    # --------------------------------------------------------
-
-    latest = candles[-1]
-
-    direction = candle_direction(
-        latest
-    )
-
-    if direction == "BULLISH":
-
-        bull += 10
-
-    elif direction == "BEARISH":
-
-        bear += 10
-
-
-    # --------------------------------------------------------
-    # SECOND LAST CANDLE
-    # --------------------------------------------------------
-
-    previous = candles[-2]
-
-    previous_direction = (
-        candle_direction(previous)
-    )
-
-    if previous_direction == "BULLISH":
-
-        bull += 5
-
-    elif previous_direction == "BEARISH":
-
-        bear += 5
-
-
-    # --------------------------------------------------------
-    # LIMIT SCORES
-    # --------------------------------------------------------
 
     bull = max(
         0,
@@ -1094,25 +1123,22 @@ def calculate_analysis(candles):
     )
 
 
-    # --------------------------------------------------------
-    # TREND
-    # --------------------------------------------------------
-
     if bull > bear:
 
         score = bull
 
         if score >= 80:
 
-            trend = "صعودی قوی"
+            trend = "Strong Bullish"
 
         elif score >= 60:
 
-            trend = "صعودی"
+            trend = "Bullish"
 
         else:
 
-            trend = "خنثی"
+            trend = "Neutral"
+
 
     elif bear > bull:
 
@@ -1120,20 +1146,22 @@ def calculate_analysis(candles):
 
         if score >= 80:
 
-            trend = "نزولی قوی"
+            trend = "Strong Bearish"
 
         elif score >= 60:
 
-            trend = "نزولی"
+            trend = "Bearish"
 
         else:
 
-            trend = "خنثی"
+            trend = "Neutral"
+
 
     else:
 
         score = 0
-        trend = "خنثی"
+
+        trend = "Neutral"
 
 
     return {
@@ -1144,11 +1172,11 @@ def calculate_analysis(candles):
 
         "ema21": ema21,
 
-        "rsi": rsi,
+        "rsi": rsi_value,
 
-        "atr": atr,
+        "atr": atr_value,
 
-        "adx": adx,
+        "adx": adx_value,
 
         "plus_di": plus_di,
 
@@ -1158,9 +1186,19 @@ def calculate_analysis(candles):
 
         "bear": bear,
 
+        "trend": trend,
+
         "score": int(score),
 
-        "trend": trend
+        "tux_ema": tux_data["ema"],
+
+        "tux_source": tux_data["source"],
+
+        "tux_signal": tux_data["signal"],
+
+        "tux_cross_up": tux_data["cross_up"],
+
+        "tux_cross_down": tux_data["cross_down"]
     }
 
 
@@ -1168,109 +1206,82 @@ def calculate_analysis(candles):
 # SIGNAL CONFIRMATION
 # ============================================================
 
-def confirm_signal(candles, analysis):
+def confirm_signal(
+    candles,
+    analysis
+):
 
     latest = candles[-1]
 
-    direction = candle_direction(
-        latest
+    bullish_candle = (
+        latest["close"]
+        > latest["open"]
     )
 
-    bull = analysis["bull"]
-    bear = analysis["bear"]
+    bearish_candle = (
+        latest["close"]
+        < latest["open"]
+    )
 
-    # --------------------------------------------------------
+
+    # ========================================================
     # BUY
-    # --------------------------------------------------------
+    # ========================================================
 
     if (
-        bull > bear
-        and direction == "BULLISH"
+        analysis["bull"]
+        > analysis["bear"]
+        and bullish_candle
     ):
 
-        gap = bull - bear
+        # TUX must at least have bullish bias
+        if (
+            analysis["tux_signal"]
+            in ["BUY", "BUY_BIAS"]
+        ):
 
-        if gap >= MIN_DIRECTION_GAP:
+            if not candle_has_bad_shadow(
+                latest,
+                "BUY"
+            ):
 
-            return "BUY"
+                return "BUY", 1
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # SELL
-    # --------------------------------------------------------
+    # ========================================================
 
     if (
-        bear > bull
-        and direction == "BEARISH"
+        analysis["bear"]
+        > analysis["bull"]
+        and bearish_candle
     ):
 
-        gap = bear - bull
+        # TUX must at least have bearish bias
+        if (
+            analysis["tux_signal"]
+            in ["SELL", "SELL_BIAS"]
+        ):
 
-        if gap >= MIN_DIRECTION_GAP:
+            if not candle_has_bad_shadow(
+                latest,
+                "SELL"
+            ):
 
-            return "SELL"
-
-
-    return "HOLD"
-
-
-# ============================================================
-# EXTREME WICK FILTER
-# ============================================================
-
-def wick_rejection(signal, candle):
-
-    data = candle_wick_data(candle)
-
-    body = data["body"]
-
-    lower = data["lower"]
-    upper = data["upper"]
-
-    # If body is tiny, do not aggressively reject.
-    if body <= 0:
-
-        return False
+                return "SELL", 1
 
 
-    # --------------------------------------------------------
-    # BUY
-    #
-    # Extremely long upper wick can mean sellers rejected
-    # higher prices.
-    # --------------------------------------------------------
-
-    if signal == "BUY":
-
-        if upper > body * 2.5:
-
-            return True
-
-
-    # --------------------------------------------------------
-    # SELL
-    #
-    # Extremely long lower wick can mean buyers rejected
-    # lower prices.
-    # --------------------------------------------------------
-
-    if signal == "SELL":
-
-        if lower > body * 2.5:
-
-            return True
-
-
-    return False
+    return "HOLD", 0
 
 
 # ============================================================
-# DYNAMIC TARGETS
+# DYNAMIC LEVELS
 # ============================================================
 
 def calculate_dynamic_targets(
     entry_price,
-    atr,
+    atr_value,
     direction
 ):
 
@@ -1278,242 +1289,156 @@ def calculate_dynamic_targets(
 
         tp1 = (
             entry_price
-            + atr * TP1_ATR
+            + atr_value * TP1_ATR
         )
 
         tp2 = (
             entry_price
-            + atr * TP2_ATR
+            + atr_value * TP2_ATR
         )
 
         tp3 = (
             entry_price
-            + atr * TP3_ATR
+            + atr_value * TP3_ATR
         )
 
         sl = (
             entry_price
-            - atr * SL_ATR
+            - atr_value * SL_ATR
         )
 
     else:
 
         tp1 = (
             entry_price
-            - atr * TP1_ATR
+            - atr_value * TP1_ATR
         )
 
         tp2 = (
             entry_price
-            - atr * TP2_ATR
+            - atr_value * TP2_ATR
         )
 
         tp3 = (
             entry_price
-            - atr * TP3_ATR
+            - atr_value * TP3_ATR
         )
 
         sl = (
             entry_price
-            + atr * SL_ATR
+            + atr_value * SL_ATR
         )
-
 
     return {
 
-        "entry": round(
-            entry_price,
-            2
-        ),
+        "entry": entry_price,
 
-        "tp1": round(
-            tp1,
-            2
-        ),
+        "tp1": tp1,
 
-        "tp2": round(
-            tp2,
-            2
-        ),
+        "tp2": tp2,
 
-        "tp3": round(
-            tp3,
-            2
-        ),
+        "tp3": tp3,
 
-        "sl": round(
-            sl,
-            2
-        )
+        "sl": sl
     }
 
 
 # ============================================================
-# SUPPORT / RESISTANCE
-# ============================================================
-
-def calculate_support_resistance(
-    candles,
-    count=20
-):
-
-    recent = candles[-count:]
-
-    support = min(
-        c["low"]
-        for c in recent
-    )
-
-    resistance = max(
-        c["high"]
-        for c in recent
-    )
-
-    return support, resistance
-
-
-# ============================================================
-# SIGNAL QUALITY
-# ============================================================
-
-def signal_quality(score, adx):
-
-    if (
-        score >= 80
-        and adx >= 25
-    ):
-
-        return "بسیار قوی"
-
-    if (
-        score >= 70
-        and adx >= 20
-    ):
-
-        return "قوی"
-
-    if score >= 60:
-
-        return "متوسط رو به قوی"
-
-    return "ضعیف"
-
-
-# ============================================================
-# PERSIAN TELEGRAM MESSAGE
+# MESSAGE
 # ============================================================
 
 def build_message(
     signal,
     analysis,
     levels,
-    support,
-    resistance
+    confirmation
 ):
 
     if signal == "BUY":
 
-        title = "🟢 سیگنال خرید طلا"
-
-        direction_text = "خرید"
+        title = (
+            "🟢 سیگنال طلا — خرید"
+        )
 
     else:
 
-        title = "🔴 سیگنال فروش طلا"
-
-        direction_text = "فروش"
-
-
-    quality = signal_quality(
-        analysis["score"],
-        analysis["adx"]
-    )
+        title = (
+            "🔴 سیگنال طلا — فروش"
+        )
 
 
-    adx_status = (
-        "روند قوی"
-        if analysis["adx"] >= 25
-        else
-        "روند متوسط"
-        if analysis["adx"] >= 20
-        else
-        "بازار کم‌قدرت / رنج"
+    if analysis["score"] >= 75:
+
+        quality = "قوی"
+
+    elif analysis["score"] >= 65:
+
+        quality = "خوب"
+
+    else:
+
+        quality = "متوسط"
+
+
+    tux_direction = (
+        "صعودی"
+        if analysis["tux_signal"]
+        in ["BUY", "BUY_BIAS"]
+        else "نزولی"
+        if analysis["tux_signal"]
+        in ["SELL", "SELL_BIAS"]
+        else "خنثی"
     )
 
 
     return f"""
 {title}
 
-━━━━━━━━━━━━━━━━
+نماد: XAU/USD
+تایم‌فریم: 5 دقیقه
 
-📌 نماد: {SYMBOL}
-⏱ تایم‌فریم: {INTERVAL}
+💰 قیمت: {analysis["price"]:.2f}
 
-💰 قیمت ورود: {levels["entry"]:.2f}
+📊 روند: {analysis["trend"]}
+امتیاز روند: {analysis["score"]}/100
 
-📊 جهت: {direction_text}
-📈 روند: {analysis["trend"]}
+EMA 9: {analysis["ema9"]:.2f}
+EMA 21: {analysis["ema21"]:.2f}
 
-⭐ امتیاز سیگنال:
-{analysis["score"]}/100
+RSI: {analysis["rsi"]:.2f}
 
-💪 قدرت روند ADX:
-{analysis["adx"]:.2f}
-
-📌 وضعیت روند:
-{adx_status}
-
+ADX: {analysis["adx"]:.2f}
 +DI: {analysis["plus_di"]:.2f}
 -DI: {analysis["minus_di"]:.2f}
 
 ━━━━━━━━━━━━━━━━
 
-📊 اندیکاتورها
+🔹 فیلتر TUX EMA Scalper
 
-EMA 9:
-{analysis["ema9"]:.2f}
-
-EMA 21:
-{analysis["ema21"]:.2f}
-
-RSI:
-{analysis["rsi"]:.2f}
-
-ATR:
-{analysis["atr"]:.2f}
+Length: 12
+Source: HLC3
+TUX EMA: {analysis["tux_ema"]:.2f}
+وضعیت TUX: {tux_direction}
 
 ━━━━━━━━━━━━━━━━
 
-🎯 اهداف پویا
+💵 ورود: {levels["entry"]:.2f}
 
-TP1:
-{levels["tp1"]:.2f}
+🎯 هدف اول: {levels["tp1"]:.2f}
+🎯 هدف دوم: {levels["tp2"]:.2f}
+🎯 هدف سوم: {levels["tp3"]:.2f}
 
-TP2:
-{levels["tp2"]:.2f}
-
-TP3:
-{levels["tp3"]:.2f}
-
-🛑 حد ضرر:
-{levels["sl"]:.2f}
+🛑 حد ضرر: {levels["sl"]:.2f}
 
 ━━━━━━━━━━━━━━━━
 
-📉 حمایت:
-{support:.2f}
+✅ تأیید کندل: {confirmation}/1
+⭐ کیفیت سیگنال: {quality}
 
-📈 مقاومت:
-{resistance:.2f}
+📌 اهداف بر اساس ATR محاسبه شده‌اند.
 
-⭐ کیفیت سیگنال:
-{quality}
-
-━━━━━━━━━━━━━━━━
-
-⚠️ این پیام تحلیل تکنیکال است.
-معامله خودکار فعال نیست.
-"""
+⚠️ تحلیل تکنیکال است و معاملات خودکار فعال نیست.
+""".strip()
 
 
 # ============================================================
@@ -1523,37 +1448,31 @@ TP3:
 def analyze():
 
     global last_processed_candle
-    global last_sent_candle
     global last_sent_signal
+    global last_sent_candle
 
-
-    # --------------------------------------------------------
-    # GET MARKET DATA
-    # --------------------------------------------------------
 
     candles = get_candles(
-        outputsize=100
+        outputsize=150
     )
 
-    if len(candles) < 50:
+
+    if len(candles) < 60:
 
         log.warning(
-            "Not enough candles: %d",
+            "Not enough market candles: %d",
             len(candles)
         )
 
         return
 
 
-    # --------------------------------------------------------
-    # CLOSED CANDLES
-    # --------------------------------------------------------
-
     closed = get_closed_candles(
         candles
     )
 
-    if len(closed) < 50:
+
+    if len(closed) < 60:
 
         log.warning(
             "Not enough CLOSED candles: %d",
@@ -1565,14 +1484,16 @@ def analyze():
 
     latest = closed[-1]
 
+
     candle_id = (
-        latest["datetime"].isoformat()
+        latest["datetime"]
+        .isoformat()
     )
 
 
-    # --------------------------------------------------------
-    # DUPLICATE CANDLE
-    # --------------------------------------------------------
+    # ========================================================
+    # DUPLICATE PROTECTION
+    # ========================================================
 
     if candle_id == last_processed_candle:
 
@@ -1583,16 +1504,13 @@ def analyze():
         latest
     )
 
+
     log.info(
-        "New closed 5m candle: %s | age=%.2f min",
+        "New closed 5m candle | %s | age=%.2f min",
         candle_id,
         age
     )
 
-
-    # --------------------------------------------------------
-    # STALE CANDLE
-    # --------------------------------------------------------
 
     if age > MAX_CANDLE_AGE_MINUTES:
 
@@ -1605,13 +1523,14 @@ def analyze():
         return
 
 
-    # --------------------------------------------------------
-    # CALCULATE INDICATORS
-    # --------------------------------------------------------
+    # ========================================================
+    # CALCULATE
+    # ========================================================
 
     analysis = calculate_analysis(
         closed
     )
+
 
     if not analysis:
 
@@ -1619,30 +1538,45 @@ def analyze():
             "Indicator calculation failed."
         )
 
+        last_processed_candle = candle_id
+
         return
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # SUPPORT / RESISTANCE
-    # --------------------------------------------------------
+    # ========================================================
 
-    support, resistance = (
-        calculate_support_resistance(
+    recent = closed[-20:]
+
+
+    support = min(
+        c["low"]
+        for c in recent
+    )
+
+
+    resistance = max(
+        c["high"]
+        for c in recent
+    )
+
+
+    # ========================================================
+    # SIGNAL
+    # ========================================================
+
+    signal, confirmation = (
+        confirm_signal(
             closed,
-            20
+            analysis
         )
     )
 
 
-    # --------------------------------------------------------
-    # SIGNAL
-    # --------------------------------------------------------
-
-    signal = confirm_signal(
-        closed,
-        analysis
-    )
-
+    # ========================================================
+    # LOG
+    # ========================================================
 
     log.info(
         "Price=%.2f | EMA9=%.2f | EMA21=%.2f | RSI=%.2f | ATR=%.2f",
@@ -1655,26 +1589,43 @@ def analyze():
 
 
     log.info(
-        "Bull=%d | Bear=%d | Trend=%s | Score=%d | ADX=%.2f | +DI=%.2f | -DI=%.2f | Signal=%s",
+        "Bull=%d | Bear=%d | Trend=%s | Score=%d | ADX=%.2f | +DI=%.2f | -DI=%.2f",
         analysis["bull"],
         analysis["bear"],
         analysis["trend"],
         analysis["score"],
         analysis["adx"],
         analysis["plus_di"],
-        analysis["minus_di"],
-        signal
+        analysis["minus_di"]
     )
 
 
-    # --------------------------------------------------------
+    log.info(
+        "TUX | Length=%d | Source=%s | EMA=%.2f | Signal=%s | CrossUp=%s | CrossDown=%s",
+        TUX_LENGTH,
+        TUX_SOURCE,
+        analysis["tux_ema"],
+        analysis["tux_signal"],
+        analysis["tux_cross_up"],
+        analysis["tux_cross_down"]
+    )
+
+
+    log.info(
+        "Final Signal=%s | Confirmation=%d/1",
+        signal,
+        confirmation
+    )
+
+
+    # ========================================================
     # HOLD
-    # --------------------------------------------------------
+    # ========================================================
 
     if signal == "HOLD":
 
         log.info(
-            "No actionable signal on this candle."
+            "No actionable signal on this closed candle."
         )
 
         last_processed_candle = candle_id
@@ -1682,16 +1633,16 @@ def analyze():
         return
 
 
-    # --------------------------------------------------------
-    # SCORE FILTER
-    # --------------------------------------------------------
+    # ========================================================
+    # MINIMUM SCORE
+    # ========================================================
 
-    if analysis["score"] < MIN_SIGNAL_SCORE:
+    if analysis["score"] < MIN_TREND_SCORE:
 
         log.info(
-            "Signal rejected by score: %d < %d",
+            "Signal rejected: score=%d < minimum=%d",
             analysis["score"],
-            MIN_SIGNAL_SCORE
+            MIN_TREND_SCORE
         )
 
         last_processed_candle = candle_id
@@ -1699,99 +1650,85 @@ def analyze():
         return
 
 
-    # --------------------------------------------------------
-    # DIRECTION GAP
-    # --------------------------------------------------------
+    # ========================================================
+    # DIRECTION VALIDATION
+    # ========================================================
 
-    gap = abs(
-        analysis["bull"]
-        - analysis["bear"]
-    )
-
-    if gap < MIN_DIRECTION_GAP:
-
-        log.info(
-            "Signal rejected by direction gap: %d < %d",
-            gap,
-            MIN_DIRECTION_GAP
-        )
-
-        last_processed_candle = candle_id
-
-        return
-
-
-    # --------------------------------------------------------
-    # EXTREME WICK
-    # --------------------------------------------------------
-
-    if wick_rejection(
-        signal,
-        latest
+    if (
+        signal == "BUY"
+        and analysis["bull"]
+        <= analysis["bear"]
     ):
 
-        log.info(
-            "Signal rejected by extreme wick filter."
-        )
+        last_processed_candle = candle_id
+
+        return
+
+
+    if (
+        signal == "SELL"
+        and analysis["bear"]
+        <= analysis["bull"]
+    ):
 
         last_processed_candle = candle_id
 
         return
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # DYNAMIC TARGETS
-    # --------------------------------------------------------
+    # ========================================================
 
     levels = calculate_dynamic_targets(
+
         analysis["price"],
+
         analysis["atr"],
+
         signal
     )
 
 
-    # --------------------------------------------------------
-    # BUILD MESSAGE
-    # --------------------------------------------------------
+    # ========================================================
+    # MESSAGE
+    # ========================================================
 
     message = build_message(
+
         signal,
+
         analysis,
+
         levels,
-        support,
-        resistance
+
+        confirmation
     )
 
 
-    # --------------------------------------------------------
-    # SEND TELEGRAM
-    # --------------------------------------------------------
+    # ========================================================
+    # SEND
+    # ========================================================
 
-    success = send_telegram(
-        message
-    )
-
-
-    if success:
+    if send_telegram(message):
 
         last_sent_signal = signal
+
         last_sent_candle = candle_id
+
         last_processed_candle = candle_id
 
         log.info(
-            "SIGNAL SENT SUCCESSFULLY | %s | candle=%s",
+            "Signal delivered successfully | %s | candle=%s",
             signal,
             candle_id
         )
 
     else:
 
-        log.error(
-            "SIGNAL WAS NOT SENT TO TELEGRAM."
+        log.warning(
+            "Telegram failed. Candle will be retried."
         )
-
-        # We do not mark the candle as processed.
-        # It can retry on the next scan.
 
 
 # ============================================================
@@ -1805,11 +1742,7 @@ def startup():
     )
 
     log.info(
-        "GOLD SIGNAL BOT v3 STARTED"
-    )
-
-    log.info(
-        "Professional Analysis: ON"
+        "GOLD SIGNAL BOT - PROFESSIONAL"
     )
 
     log.info(
@@ -1823,38 +1756,59 @@ def startup():
     )
 
     log.info(
-        "Scan interval: %d seconds",
-        CHECK_SECONDS
+        "EMA: %d / %d",
+        EMA_FAST,
+        EMA_SLOW
     )
 
     log.info(
-        "Minimum Signal Score: %d/100",
-        MIN_SIGNAL_SCORE
+        "RSI Period: %d",
+        RSI_PERIOD
     )
 
     log.info(
-        "Minimum Direction Gap: %d",
-        MIN_DIRECTION_GAP
+        "ADX Period: %d",
+        ADX_PERIOD
     )
 
     log.info(
-        "ADX: ON"
+        "TUX EMA Scalper: ON"
     )
 
     log.info(
-        "Dynamic ATR Targets: ON"
+        "TUX Length: %d",
+        TUX_LENGTH
     )
 
     log.info(
-        "Dynamic Stop Loss: ON"
+        "TUX Source: %s",
+        TUX_SOURCE
+    )
+
+    log.info(
+        "TUX Lookback: %d",
+        TUX_LOOKBACK
+    )
+
+    log.info(
+        "ATR TP: %.1f / %.1f / %.1f",
+        TP1_ATR,
+        TP2_ATR,
+        TP3_ATR
+    )
+
+    log.info(
+        "ATR SL: %.1f",
+        SL_ATR
+    )
+
+    log.info(
+        "Minimum Trend Score: %d",
+        MIN_TREND_SCORE
     )
 
     log.info(
         "Closed Candle Protection: ON"
-    )
-
-    log.info(
-        "Extreme Wick Protection: ON"
     )
 
     log.info(
@@ -1870,10 +1824,6 @@ def startup():
     )
 
     log.info(
-        "Telegram language: Persian"
-    )
-
-    log.info(
         "================================================"
     )
 
@@ -1886,6 +1836,7 @@ def main():
 
     startup()
 
+
     while True:
 
         try:
@@ -1895,7 +1846,7 @@ def main():
         except KeyboardInterrupt:
 
             log.info(
-                "Bot stopped manually."
+                "Bot stopped."
             )
 
             break
@@ -1907,13 +1858,14 @@ def main():
                 e
             )
 
+
         time.sleep(
             CHECK_SECONDS
         )
 
 
 # ============================================================
-# RUN
+# ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
