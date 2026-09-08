@@ -119,12 +119,12 @@ def sleep_next():
     now=now_utc(); b=now.replace(minute=(now.minute//5)*5,second=0,microsecond=0)+timedelta(minutes=5,seconds=75); time.sleep(max(10,(b-now).total_seconds()))
 
 def main():
-    if not all([BOT_TOKEN,CHAT_ID,API_KEY]): raise RuntimeError('Set BOT_TOKEN, CHAT_ID and API_KEY in Railway Variables.')
-    log.info('FINAL GOLD BOT | XAU/USD | 5min | TUX EMA Scalper Length=12 HLC3 | Auto Trading OFF')
-    while True:
-        try:
-            if in_window(): analyze(); sleep_next()
-            else: time.sleep(60)
-        except Exception as e: log.exception('Main loop error: %s',e); time.sleep(30)
+    if not all([BOT_TOKEN, CHAT_ID, API_KEY]):
+        raise RuntimeError("Set BOT_TOKEN, CHAT_ID and API_KEY in GitHub Actions Secrets.")
+    log.info("GITHUB ACTIONS | XAU/USD | 5min | TUX EMA Scalper Length=12 HLC3 | Auto Trading OFF")
+    if in_window():
+        analyze()
+    else:
+        log.info("Outside Tehran signal window; no market-data request made.")
 
 if __name__=='__main__': main()
